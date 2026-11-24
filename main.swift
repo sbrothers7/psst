@@ -7,6 +7,7 @@ import Network
 import Carbon.HIToolbox
 import CryptoKit
 import ServiceManagement
+import UniformTypeIdentifiers
 
 let serviceType = "_psst._tcp"
 let port: NWEndpoint.Port = 47820
@@ -68,6 +69,9 @@ func route(to host: String, own: String?, ads: [HostAd], down: Set<String>) -> R
 struct Snapshot: Codable, Equatable {
     struct Room: Codable, Equatable {
         var owner = "", members: [String: String] = [:], invites: [String] = [], requests: [String] = [], nicks: [String: String] = [:]
+        var pass: String?  // password hash, for rooms that have one
+        var desc: String?  // shown when browsing rooms
+        var type: Int?     // who can get in: see typeNames
     }
     var rooms: [String: Room] = [:]
 }
@@ -78,6 +82,14 @@ let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? S
 let repo = "https://github.com/sbrothers7/psst"
 let releases = repo + "/releases/latest/download/"  // not the API: no rate limit for a school sharing one IP
 let updateKey = "Oyw6t/z9rkWjGdtYZdOm8b3eekjGoH1HCViAYbINriA="  // Ed25519 public key; the private half never leaves the release Mac (~/.config/psst/update.key)
+
+/// "…/releases/tag/v1.4.0" → "1.4.0": github.com/…/releases/latest redirects to the latest release's tag, so a HEAD
+/// request gives the version without downloading anything. nil when there's no release (it lands on /releases).
+func tagVersion(_ url: URL?) -> String? {
+    guard let u = url, u.pathComponents.suffix(2).first == "tag" else { return nil }
+    let tag = u.lastPathComponent
+    return tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+}
 
 func isNewer(_ v: String, than current: String) -> Bool {
     v.trimmingCharacters(in: .whitespacesAndNewlines).compare(current, options: .numeric) == .orderedDescending
@@ -110,6 +122,9 @@ struct Msg: Codable {
     var since: Double? = nil          // hello: when my own host started, so the host knows who is next in line
     var snap: Snapshot? = nil         // rep: rooms, for the next host in line
     var batch: [Msg]? = nil           // rep: messages, for the next host in line
+    var descs: [String: String]? = nil // rooms: room -> its description
+    var pic: String? = nil            // hello/nick/pic: profile picture: "letters", a base64 JPEG or PNG, "" for none
+    var types: [String: Int]? = nil   // rooms/create: room -> who can get in (see typeNames)
 }
 
 // MARK: - End-to-end encryption (private rooms)
@@ -197,6 +212,46 @@ func clean(_ s: String, lower: Bool = false) -> String {
 
 func validName(_ n: String) -> Bool { (2...20).contains(n.count) && clean(n) == n }
 
+/// A room password as sent: hashed, so the typed password never leaves this Mac. Not tied to the room's name,
+/// so it keeps working after /room rename.
+// ponytail: anyone watching the network can replay the hash to join; it keeps people out, not eavesdroppers.
+func roomPass(_ password: String) -> String {
+    Data(SHA256.hash(data: Data("psst room \(password.trimmingCharacters(in: .whitespaces))".utf8))).base64EncodedString()
+}
+
+/// Room types, by number: who can get in. A room without one is 0.
+let typeNames = ["invite only", "password only", "invite or password", "open access"]
+let typeList = "0 invite only · 1 password only · 2 invite or password · 3 open access"
+
+/// Words /room reads as options, so they can't name a room ("current" is the room you're in).
+let reservedRooms: Set<String> = ["public", "current", "create", "set", "members"]
+
+/// After "/room create ": [room name] [desc] [type]. A last word 0–3 is the type (default 0); quote a description that ends in a digit.
+func createArgs(_ rest: String) -> (room: String, desc: String, type: Int) {
+    var w = rest.split(separator: " ").map(String.init)
+    let room = w.isEmpty ? "" : clean(w.removeFirst(), lower: true)
+    let type = w.last.flatMap { Int($0) }.flatMap { typeNames.indices.contains($0) ? $0 : nil }
+    if type != nil { w.removeLast() }
+    return (room, unquote(Substring(w.joined(separator: " "))), type ?? 0)
+}
+
+/// After "/room ": [room name] set [name|desc|password|type] [new]. No room name, or "current": the room you're in.
+/// nil when it isn't a set command; `field` is lowercased and may be anything (the caller checks it).
+func roomEdit(_ arg: String, current: String) -> (room: String, field: String, value: String)? {
+    var w = arg.split(separator: " ", maxSplits: 1).map(String.init), room = current
+    if w.first?.lowercased() != "set" {
+        guard w.count == 2 else { return nil }
+        room = w[0].lowercased() == "current" ? current : clean(w[0], lower: true)
+        w = w[1].split(separator: " ", maxSplits: 1).map(String.init)
+        guard w.first?.lowercased() == "set" else { return nil }
+    }
+    let rest = w.count > 1 ? w[1].split(separator: " ", maxSplits: 1).map(String.init) : []
+    return (room, rest.first?.lowercased() ?? "", rest.count > 1 ? rest[1].trimmingCharacters(in: .whitespaces) : "")
+}
+
+/// `"chess club"` → chess club: quotes are optional around a description.
+func unquote(_ s: Substring) -> String { s.trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: "\"“”")) }
+
 // ponytail: enforced on this Mac only; a host can't check it without accounts.
 let nameCooldown: TimeInterval = 14 * 86400
 
@@ -214,6 +269,56 @@ let nameColors: [(name: String, color: NSColor)] = [
 ]
 
 /// The color someone picked, else one picked from their name (the same on every Mac).
+/// "jordan_k" → "JK", "alex" → "A": the letters on a picture made from a username.
+func initials(_ name: String) -> String {
+    let parts = name.split(whereSeparator: { $0 == "_" || $0 == "-" }).prefix(2)
+    return parts.isEmpty ? String(name.prefix(1)).uppercased() : parts.map { String($0.prefix(1)).uppercased() }.joined()
+}
+
+/// Only JPEG and PNG are decoded from the network, and only small ones (see validPic).
+func isImageData(_ d: Data) -> Bool { d.starts(with: [0xFF, 0xD8, 0xFF]) || d.starts(with: [0x89, 0x50, 0x4E, 0x47]) }
+
+/// A profile picture as sent: "letters", or a small JPEG/PNG in base64. Anything else counts as no picture.
+func validPic(_ s: String?) -> String {
+    guard let s, s == "letters" || (s.count <= 16000 && Data(base64Encoded: s).map(isImageData) == true) else { return "" }
+    return s
+}
+
+/// A round picture: the image someone set, or their initials on their name color. nil for no picture.
+func avatarImage(_ pic: String, name: String, color: NSColor, side: CGFloat = 22) -> NSImage? {
+    var img: NSImage?
+    if pic != "letters" {
+        guard let d = Data(base64Encoded: pic), isImageData(d), let i = NSImage(data: d) else { return nil }
+        img = i
+    }
+    return NSImage(size: NSSize(width: side, height: side), flipped: false) { r in
+        NSBezierPath(ovalIn: r).addClip()
+        if let img { img.draw(in: r); return true }
+        color.setFill()
+        r.fill()
+        let t = initials(name) as NSString
+        let a: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: side * 0.42, weight: .semibold), .foregroundColor: NSColor.white]
+        let size = t.size(withAttributes: a)
+        t.draw(at: NSPoint(x: r.midX - size.width / 2, y: r.midY - size.height / 2), withAttributes: a)
+        return true
+    }
+}
+
+/// A chosen picture, center-cropped to a square and shrunk to 96 px, as JPEG (a few KB to send).
+func squareJPEG(_ img: NSImage, px: Int = 96) -> Data? {
+    guard let src = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+    let side = min(src.width, src.height)
+    guard side > 0, let crop = src.cropping(to: CGRect(x: (src.width - side) / 2, y: (src.height - side) / 2, width: side, height: side)),
+          let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px, bitsPerSample: 8, samplesPerPixel: 4,
+                                     hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)
+    else { return nil }
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+    NSImage(cgImage: crop, size: NSSize(width: px, height: px)).draw(in: NSRect(x: 0, y: 0, width: px, height: px))
+    NSGraphicsContext.restoreGraphicsState()
+    return rep.representation(using: .jpeg, properties: [.compressionFactor: 0.7])
+}
+
 func nameColor(_ name: String, _ pick: String?) -> NSColor {
     if let c = nameColors.first(where: { $0.name == pick }) { return c.color }
     let h = name.unicodeScalars.reduce(UInt32(0)) { $0 &* 31 &+ $1.value }
@@ -273,41 +378,88 @@ let emojiIndex: [(code: String, emoji: String)] = {
 
 // MARK: - Typing guide
 
-let commands: [(name: String, args: [String], help: String)] = [  // help fits one line of the guide
+let commands: [(name: String, args: [String], help: String)] = [  // help fits one line of the guide; * = required
     ("/status", ["username"], "see who is online"),
-    ("/room", ["room name"], "people here, or make a new room"),
-    ("/rooms", ["room name"], "rooms on the network"),
-    ("/join", ["room name"], "switch rooms, or join when invited"),
-    ("/request", ["room name"], "ask to join a room (once a minute)"),
+    ("/room", ["create|set|members*"], "make a room, change one, or see who's in it"),
+    ("/browse", ["room name"], "browse rooms on the network"),
+    ("/join", ["room name", "password"], "switch rooms, or join with an invite or password"),
+    ("/request", ["room name*"], "ask to join a room (once a minute)"),
     ("/accept", ["username|all"], "accept room join request"),
-    ("/invite", ["username"], "invite someone to this room"),
+    ("/invite", ["username*"], "invite someone to this room"),
     ("/leave", [], "leave this room"),
     ("/nick", ["nickname"], "set your name in this room (blank to clear)"),
-    ("/friend", ["list|add|remove", "username"], "manage friends"),
+    ("/friend", ["list|add|remove*", "username"], "manage friends"),
     ("/block", ["username"], "block or unblock (blank to list)"),
-    ("/history", [], "replay recent messages"),
+    ("/history", ["on|off"], "on: keep messages and scroll back; off: they fade"),
     ("/settings", [], "open settings"),
     ("/key", ["username"], "key code to compare in person"),
-    ("/trust", ["username"], "trust someone's new key"),
+    ("/trust", ["username*"], "trust someone's new key"),
     ("/quit", [], "quit Psst (⌘Q)"),
 ]
 
-/// "/friend <list|add|remove> <username>": one placeholder per parameter, written like the README.
+/// "/friend [list|add|remove]* [username]": one placeholder per parameter, written like the README; * = required.
 func usage(_ c: (name: String, args: [String], help: String)) -> String {
-    ([c.name] + c.args.map { "<\($0)>" }).joined(separator: " ")
+    ([c.name] + c.args.map(placeholder)).joined(separator: " ")
 }
+func placeholder(_ arg: String) -> String { arg.hasSuffix("*") ? "[\(arg.dropLast())]*" : "[\(arg)]" }
 
 /// Header shown while typing a command's arguments, with the parameter under the cursor as `focus`.
-/// "/friend add b" → ("/friend <list|add|remove> <username>", "<username>", help). nil for commands without parameters.
-func paramGuide(_ text: String) -> (label: String, focus: String, help: String)? {
-    let parts = text.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: false)
-    guard text.hasPrefix("/"), parts.count == 2, let cmd = commands.first(where: { $0.name == parts[0].lowercased() }),
-          !cmd.args.isEmpty else { return nil }
-    let typing = parts[1].split(separator: " ", omittingEmptySubsequences: false).count - 1
-    return (usage(cmd), "<\(cmd.args[min(typing, cmd.args.count - 1)])>", cmd.help)
+/// "/friend add b" → ("/friend [list|add|remove] [username]", "[username]", help). nil for commands without parameters.
+func paramGuide(_ text: String, _ c: Ctx = Ctx()) -> (label: String, focus: String, help: String)? {
+    let low = text.lowercased()
+    if low.hasPrefix("/room ") { return roomGuide(String(text.dropFirst(6)), c) }
+    guard text.hasPrefix("/"), let cmd = commands.first(where: { low.hasPrefix($0.name + " ") }), !cmd.args.isEmpty else { return nil }
+    let typing = text.dropFirst(cmd.name.count + 1).split(separator: " ", omittingEmptySubsequences: false).count - 1
+    return (usage(cmd), "[\(cmd.args[min(typing, cmd.args.count - 1)].replacingOccurrences(of: "*", with: ""))]", cmd.help)
 }
 
-struct Suggestion { var label: String, detail = "", replace: String, dot: Bool? = nil, run = false }
+/// /room does several things, so its guide follows what's typed: the format of the option picked, and what Enter would do.
+func roomGuide(_ rest: String, _ c: Ctx) -> (label: String, focus: String, help: String) {
+    let w = rest.split(separator: " ", omittingEmptySubsequences: false).map(String.init)  // the last word is being typed
+    let first = w[0].lowercased(), here = "#" + c.room
+    let createLabel = "/room create [room name]* [desc] [type]", setLabel = "/room [room name] set [name|desc|password|type]* [new]*"
+    if w.count == 1 {  // an option, or the room to change
+        guard !first.isEmpty, !["create", "set", "members"].contains(where: { $0.hasPrefix(first) }) else {
+            return c.room == "public" ? ("/room [create|members]*", "[create|members]", "make a room, or see who's in #public")
+                : ("/room [create|set|members]*", "[create|set|members]", "make a room, change \(here) (or a room you name first), or see who's in it")
+        }
+        let r = first == "current" ? c.room : clean(first, lower: true)
+        return (setLabel, "[room name]", c.joined.contains(r) && r != "public" ? "then set, to change #\(r)" : "a room you're in, or current for \(here)")
+    }
+    if first == "create" {
+        let name = clean(w[1], lower: true), r = "#" + name
+        if w.count == 2 {
+            return (createLabel, "[room name]", reservedRooms.contains(name) ? "\(r) can't be a room name"
+                    : c.open[name] != nil ? "\(r) already exists: /join it instead" : "name the new room (one word)")
+        }
+        if let k = Int(w.last!), typeNames.indices.contains(k) {
+            return (createLabel, "[type]", "\(k): \(typeNames[k])" + (k == 1 || k == 2 ? " · you'll set the password next" : ""))
+        }
+        return (createLabel, "[desc]", "optional: what \(r) is about, for /browse · end with a type: \(typeList)")
+    }
+    if first == "members" { return ("/room members", "", "who's in \(here)") }
+    let s = first == "set" ? 0 : 1, r = s == 0 || first == "current" ? c.room : clean(first, lower: true)  // where set is
+    if w.count == 2, s == 1 { return (setLabel, "", "set, to change #\(r)") }
+    guard w[s].lowercased() == "set" else { return (setLabel, "", "set goes after the room name") }
+    guard r != "public" else { return (setLabel, "[room name]", "#public can't be changed: name a room you're in") }
+    guard c.joined.contains(r) else { return (setLabel, "[room name]", "you're not in #\(r): /join it first") }
+    if w.count == s + 2 { return (setLabel, "[name|desc|password|type]", "what to change about #\(r)") }
+    let new = w[(s + 2)...].joined(separator: " ").trimmingCharacters(in: .whitespaces), type = c.types[r] ?? 0
+    switch w[s + 1].lowercased() {
+    case "name":
+        let n = clean(new, lower: true)
+        return (setLabel, "[new]", n.isEmpty ? "#\(r)'s new name" : reservedRooms.contains(n) ? "#\(n) can't be a room name"
+                : c.open[n] != nil ? "#\(n) is taken" : "renames #\(r) to #\(n)")
+    case "desc": return (setLabel, "[new]", "describes #\(r) for people in /browse")
+    case "password": return (setLabel, "[new]", "#\(r)'s new password" + (type == 0 || type == 3 ? " · then pick type 1 or 2 so it's used" : ""))
+    case "type": return (setLabel, "[new]", "#\(r) is now \(type): \(typeNames[type])")
+    default: return (setLabel, "[name|desc|password|type]", "set name, desc, password or type")
+    }
+}
+
+/// A row of the typing guide. Picking it: opens `sub` (a menu, typed text untouched), runs `replace` as a command (`run`),
+/// or puts `replace` in the field.
+struct Suggestion { var label: String, detail = "", replace: String, dot: Bool? = nil, run = false, sub: [Suggestion]? = nil }
 
 /// What the typing guide knows: the network as this Mac sees it.
 struct Ctx {
@@ -317,6 +469,10 @@ struct Ctx {
     var open: [String: Int] = [:]                          // every private room on the network -> people in it
     var members: [String] = [], nicks: [String: String] = [:] // this room's people and their nicknames here
     var requests: [String] = []                            // people asking to join this room, latest last
+    var locked: [String] = []                              // rooms that take a password
+    var descs: [String: String] = [:]                      // room -> description
+    var types: [String: Int] = [:]                         // room -> who can get in (see typeNames)
+    var asks: [String: [Suggestion]] = [:]                 // questions Psst asked (a menu's title -> its answers)
 }
 
 /// What you can do to someone, after picking them from a list.
@@ -333,7 +489,26 @@ func actions(_ n: String, _ c: Ctx) -> [Suggestion] {
     return a
 }
 
+/// Commands that, sent bare, open their list as a menu to pick from. The value is the typed text that lists it.
+func listMenu(_ s: String) -> String? {
+    let c = s.lowercased().split(separator: " ").joined(separator: " ")
+    let lists = ["/status", "/room", "/browse", "/join", "/request", "/invite", "/block", "/friend list", "/friend add", "/friend remove"]
+    return c == "/friend" ? "/friend list " : lists.contains(c) ? c + " " : nil
+}
+
+/// An open menu's rows, rebuilt from what's known now: the command's list, then each picked row's menu in turn.
+/// Stops where a picked row is gone (a friend just removed), so the menu backs up instead of showing stale rows.
+func menuRows(_ source: String, _ path: [String], _ c: Ctx) -> (depth: Int, title: Suggestion?, rows: [Suggestion]) {
+    var out = (depth: 0, title: Suggestion?.none, rows: suggest(source, c))
+    for label in path {
+        guard let r = out.rows.first(where: { $0.label == label }), let sub = r.sub else { break }
+        out = (out.depth + 1, r, sub)
+    }
+    return out
+}
+
 func suggest(_ text: String, _ c: Ctx) -> [Suggestion] {
+    if let answers = c.asks[text] { return answers }
     if text.hasPrefix("#"), !text.contains(" ") {  // "#room message" sends there and switches
         let q = text.dropFirst().lowercased()
         return c.joined.filter { $0.hasPrefix(q) && $0 != q }.map { Suggestion(label: "#" + $0, replace: "#\($0) ") }
@@ -343,42 +518,68 @@ func suggest(_ text: String, _ c: Ctx) -> [Suggestion] {
         let typed = parts[0].lowercased()
         guard parts.count == 2 else {  // still typing the command name
             return commands.filter { $0.name.hasPrefix(typed) }
-                .map { Suggestion(label: $0.name, detail: $0.help, replace: $0.args.isEmpty ? $0.name : $0.name + " ") }  // parameters show once picked
+                .map { Suggestion(label: $0.name, detail: $0.help, replace: $0.args.isEmpty ? $0.name : $0.name + " ", run: true) }  // Tab: type its parameters
         }
         guard let cmd = commands.first(where: { $0.name == typed }) else { return [] }
         let words = parts[1].split(separator: " ", omittingEmptySubsequences: false).map(String.init)
         let token = words.last!.lowercased(), base = String(text.dropLast(words.last!.count))
         func fits(_ s: String) -> Bool { s.lowercased().hasPrefix(token) }
-        func plain(_ options: [String]) -> [Suggestion] { options.filter(fits).map { Suggestion(label: $0, replace: base + $0) } }
+        func plain(_ options: [String]) -> [Suggestion] { options.filter(fits).map { Suggestion(label: $0, replace: base + $0, run: true) } }
         func people(_ names: [String], inRoom: Bool = false, tag: Bool = true) -> [Suggestion] {  // picking one opens actions
             names.filter(fits).map { n in
                 Suggestion(label: (inRoom ? c.nicks[n].map { "\($0) · " } ?? "" : "") + n,
                            detail: n == c.me ? "you" : tag && c.friends.contains(n) ? "friend" : "",
-                           replace: base + n + " ", dot: inRoom || c.roster.contains(n))
+                           replace: base, dot: inRoom || c.roster.contains(n), sub: actions(n, c))  // replace: the list it's in
             }
         }
         let others = c.roster.filter { $0 != c.me }
         switch (cmd.name, words.count) {
         case ("/status", 1): return people(c.roster.filter(c.friends.contains) + c.roster.filter { !c.friends.contains($0) })
-        case ("/status", 2), ("/room", 2): return actions(words[0], c)
-        case ("/room", 1) where token.isEmpty: return people(c.members, inRoom: true)  // typing a name = making a room
-        case ("/rooms", 1):
-            return c.open.keys.sorted().filter(fits).map { r in
-                let can = c.joined.contains(r) || c.invited.contains(r)
-                return Suggestion(label: "#" + r, detail: "\(c.open[r]!) in it" + (c.joined.contains(r) ? " · you're in" : c.invited.contains(r) ? " · invited" : ""),
-                                  replace: can ? "/join \(r)" : "/request \(r)", run: true)
+        case ("/room", 1):  // an option, or a room you're in to change
+            var options = [("create", "make a room")]
+            if c.room != "public" {  // in public: nothing to edit offered
+                options += [("set", "change #\(c.room)")] + c.joined.filter { $0 != "public" && $0 != c.room }.map { ($0, "change #\($0)") }
             }
-        case ("/join", 1): return plain(Array(Set(c.joined + c.invited)).sorted())
-        case ("/request", 1): return plain(c.open.keys.sorted().filter { !c.joined.contains($0) })
+            return options.filter { fits($0.0) }.map { Suggestion(label: $0.0, detail: $0.1, replace: base + $0.0 + ($0.0 == "create" || $0.0 == "set" ? " " : " set ")) }
+                + (fits("members") ? [Suggestion(label: "members", detail: "who's in #\(c.room)", replace: base, sub: suggest(base + "members ", c))] : [])
+        case ("/room", 2) where words[0].lowercased() == "members": return people(c.members, inRoom: true)
+        case ("/room", _) where words[0].lowercased() != "create":  // [room name] set [name|desc|password|type] [new]
+            let s = words[0].lowercased() == "set" ? 0 : 1, r = s == 0 || words[0].lowercased() == "current" ? c.room : clean(words[0], lower: true)
+            let type = c.types[r] ?? 0, set = words[s].lowercased() == "set"
+            switch words.count - s {
+            case 1: return fits("set") ? [Suggestion(label: "set", detail: "change #\(r)", replace: base + "set ")] : []
+            case 2 where set:
+                let fields = [("name", "rename #\(r)"), ("desc", "describe #\(r) for /browse"), ("password", "change #\(r)'s password"),
+                              ("type", "who can get in · now \(typeNames[type])")]
+                return fields.filter { fits($0.0) }.map { Suggestion(label: $0.0, detail: $0.1, replace: base + $0.0 + " ") }
+            case 3 where set && words[s + 1].lowercased() == "type":
+                return typeNames.indices.filter { fits(String($0)) }
+                    .map { Suggestion(label: "\($0)", detail: typeNames[$0] + ($0 == type ? " · now" : ""), replace: base + "\($0)", run: true) }
+            default: return []
+            }
+        case ("/browse", 1):
+            return c.open.keys.sorted().filter(fits).map { r in  // what Enter does depends on the room's type
+                let type = c.types[r] ?? (c.locked.contains(r) ? 2 : 0), invited = c.invited.contains(r) && type != 1
+                let can = c.joined.contains(r) || invited || type == 3
+                let detail = "\(c.open[r]!) in it · " + (c.joined.contains(r) ? "you're in" : invited ? "invited" : typeNames[type]) + (c.descs[r].map { " · " + $0 } ?? "")
+                if can || type == 0 { return Suggestion(label: "#" + r, detail: detail, replace: can ? "/join \(r)" : "/request \(r)", run: true) }
+                if type == 1 { return Suggestion(label: "#" + r, detail: detail, replace: "/join \(r) ") }  // type the password
+                return Suggestion(label: "#" + r, detail: detail, replace: base,
+                                  sub: [Suggestion(label: "type the password", replace: "/join \(r) "), Suggestion(label: "ask to join", replace: "/request \(r)", run: true)])
+            }
+        case ("/join", 1):
+            let can = Set(c.joined + c.invited.filter { c.types[$0] != 1 } + c.types.filter { $0.value == 3 }.map(\.key))
+            return plain(can.sorted()) + c.locked.filter { !can.contains($0) && fits($0) }.map { Suggestion(label: $0, detail: "password", replace: base + $0 + " ") }
+        case ("/request", 1): return plain(c.open.keys.sorted().filter { !c.joined.contains($0) && c.types[$0] != 1 && c.types[$0] != 3 })
         case ("/accept", 1): return plain(c.requests.reversed() + ["all"])
         case ("/invite", 1): return plain(others.filter { !c.members.contains($0) })
         case ("/block", 1): return plain(others + c.blocked.filter { !c.roster.contains($0) })
         case ("/key", 1): return plain(others)
         case ("/trust", 1): return plain(c.changed)
+        case ("/history", 1): return plain(["on", "off"])
         case ("/friend", 1): return plain(["list ", "add ", "remove "])
         case ("/friend", 2) where words[0] == "list":
             return people(c.friends.filter(c.roster.contains) + c.friends.filter { !c.roster.contains($0) }, tag: false)
-        case ("/friend", 3) where words[0] == "list": return actions(words[1], c)
         case ("/friend", 2) where words[0] == "add": return plain(others.filter { !c.friends.contains($0) })
         case ("/friend", 2) where words[0] == "remove": return plain(c.friends)
         default: return []
@@ -492,6 +693,7 @@ final class Server {
         var hidden = false
         var key = ""  // public key, passed on so members can encrypt to each other
         var since: Double?  // when this Mac's own host started; the oldest are next in line
+        var pic = ""        // profile picture (see validPic)
         var rooms: Set<String> = ["public"]
         var nicks: [String: String] = [:]  // room -> nickname there
         let send: (Msg) -> Void
@@ -502,6 +704,10 @@ final class Server {
     var owners: [String: Int] = [:]        // room -> creator (-1: not back yet after a takeover); closes when they leave
     var requests: [String: [Int]] = [:]    // room -> client ids asking to join, latest last
     var lastAsk: [String: Double] = [:]    // name -> when they last asked; one request a minute
+    var passwords: [String: String] = [:]  // room -> password hash; anyone who has it can join
+    var descs: [String: String] = [:]      // room -> description, shown when browsing
+    var types: [String: Int] = [:]         // room -> who can get in (see typeNames); none: 0, invite only
+    var tried: [Int: Double] = [:]         // client -> last wrong password; one guess every 3 s
     var history: [Msg] = []
     var retention: Double
     var successors: [Int] = [], lastSnap: Snapshot?  // next in line, and what they were last sent
@@ -581,13 +787,16 @@ final class Server {
 
     /// Deletes a room: everyone in it is sent back to public, its invites and history are erased.
     func close(_ room: String) {
-        send(Msg(t: "note", room: room, text: "this room was closed"), to: room)
+        send(Msg(t: "note", room: room, text: "was closed"), to: room)
         for (id, var c) in clients where c.rooms.remove(room) != nil {
             c.nicks[room] = nil
             clients[id] = c
             c.send(Msg(t: "left", room: room))
         }
         owners[room] = nil
+        passwords[room] = nil
+        descs[room] = nil
+        types[room] = nil
         invites[room] = nil
         requests[room] = nil
         restore[room] = nil
@@ -604,18 +813,26 @@ final class Server {
 
         switch m.t {
         case "hello", "nick":
+            let was = c
             c.name = unique(clean(m.from ?? ""), id)
             c.hidden = m.hidden ?? false
             c.key = validKey(m.key) ?? c.key
             c.since = m.since ?? c.since
+            c.pic = validPic(m.pic)
             c.ready = true
             clients[id] = c
             c.send(Msg(t: "you", from: c.name))
+            if m.t == "hello" {  // everyone's pictures, once; after that only changes travel
+                for o in clients.values where o.ready && !o.hidden && !o.pic.isEmpty && o.name != c.name { c.send(Msg(t: "pic", from: o.name, pic: o.pic)) }
+            }
+            if !c.hidden, m.t == "hello" || c.pic != was.pic || c.name != was.name || was.hidden {  // invisible: no picture either
+                for o in clients.values { o.send(Msg(t: "pic", from: c.name, pic: c.pic)) }
+            }
             if m.t == "hello" {
                 replay("public", to: c, after: m.ts ?? 0)  // only what they haven't seen
                 if tookOver == nil, !restore.isEmpty { takeOver() }
                 restoreRooms(id)
-                c.send(Msg(t: "rooms", counts: roomCounts()))
+                c.send(roomsMsg())
             }
             roster()
             for r in clients[id]?.rooms ?? [] where r != "public" { members(r) }
@@ -641,25 +858,40 @@ final class Server {
             successors.forEach { clients[$0]?.send(Msg(t: "rep", batch: [out])) }
 
         case "create":
-            guard !room.isEmpty, room != "public", owners[room] == nil else { return note("#\(room) is taken") }
+            guard !room.isEmpty, !reservedRooms.contains(room) else { return note("#\(room) can't be a room name") }
+            guard owners[room] == nil else { return note("#\(room) is taken") }
             owners[room] = id
+            if let p = m.text, (1...64).contains(p.count) { passwords[room] = p }  // older Psst: a password makes it type 2
+            types[room] = m.types?.values.first.flatMap { typeNames.indices.contains($0) ? $0 : nil } ?? (passwords[room] == nil ? 0 : 2)
+            if let t = m.descs?.values.first.map({ String($0.trimmingCharacters(in: .whitespacesAndNewlines).prefix(80)) }), !t.isEmpty { descs[room] = t }
             c.rooms.insert(room)
             clients[id] = c
             c.send(Msg(t: "joined", room: room))
             members(room)
             roomList()
+            if types[room] == 1 || types[room] == 2, passwords[room] == nil { c.send(Msg(t: "askpass", room: room)) }
+            else if passwords[room] != nil { note("anyone with the password can /join \(room) [password]", room) }
 
-        case "join":
-            guard room == "public" || c.rooms.contains(room) || invites[room]?.contains(id) == true
-            else { return note(owners[room] == nil ? "no room #\(room)" : "#\(room) needs an invite: /request \(room) to ask") }
+        case "join":  // by type: 0 invite, 1 password, 2 either, 3 anyone
+            if room == "public" || c.rooms.contains(room) { return enter(id, room) }
+            guard owners[room] != nil else { return note("no room #\(room)") }
+            let type = types[room] ?? 0
+            if type == 3 || (type != 1 && invites[room]?.contains(id) == true) { return enter(id, room) }
+            guard type != 0 else { return note("#\(room) needs an invite: /request \(room) to ask") }
+            guard let pass = passwords[room] else { return note("#\(room) has no password yet") }
+            guard let p = m.text else { return note("#\(room) needs a password: /join \(room) [password]" + (type == 2 ? ", or /request \(room) to ask" : "")) }
+            let now = Date().timeIntervalSince1970
+            guard now - (tried[id] ?? 0) >= 3 else { return note("try again later") }
+            guard p == pass else { tried[id] = now; return note("wrong password for #\(room)") }
             enter(id, room)
 
         case "request":
             guard owners[room] != nil else { return note("no room #\(room)") }
             guard !c.rooms.contains(room) else { return note("you're already in #\(room)") }
-            if invites[room]?.contains(id) == true { return enter(id, room) }
+            if types[room] == 1 { return note("#\(room) takes a password, not requests: /join \(room) [password]") }
+            if types[room] == 3 || invites[room]?.contains(id) == true { return enter(id, room) }
             let now = Date().timeIntervalSince1970, wait = 60 - (now - (lastAsk[c.name] ?? 0))
-            guard wait <= 0 else { return note("one request a minute: try again in \(Int(wait.rounded(.up))) s") }
+            guard wait <= 0 else { return note("try again in \(Int(wait.rounded(.up))) s") }
             lastAsk[c.name] = now
             requests[room, default: []].removeAll { $0 == id }
             requests[room, default: []].append(id)
@@ -691,7 +923,8 @@ final class Server {
 
         case "invite":
             let name = clean(m.text ?? "")
-            guard room != "public", c.rooms.contains(room) else { return note("make a room first: /room <room name>") }
+            guard room != "public", c.rooms.contains(room) else { return note("make a room first: /room create [room name]") }
+            guard types[room] != 1 else { return note("#\(room) is password only: share the password, or /room set type 2", room) }
             guard let target = clients.first(where: { $0.value.ready && $0.value.name == name && !$0.value.hidden })
             else { return note("no one named \(name)") }  // invisible people can't be found by name either
             guard !target.value.rooms.contains(room) else { return note("\(name) is already here", room) }
@@ -712,6 +945,49 @@ final class Server {
 
         case "history":
             if c.rooms.contains(room) { replay(room, to: c) }
+
+        case "rename":  // any member, like /invite; everyone in it, invited or asking follows along
+            let new = clean(m.text ?? "", lower: true)
+            guard room != "public", c.rooms.contains(room) else { return note("/join the room to rename it") }
+            guard !new.isEmpty, !reservedRooms.contains(new) else { return note(new.isEmpty ? "/room set name [new]" : "#\(new) can't be a room name", room) }
+            guard owners[new] == nil else { return note("#\(new) is taken", room) }
+            func move<T>(_ d: inout [String: T]) { if let v = d.removeValue(forKey: room) { d[new] = v } }
+            move(&owners); move(&passwords); move(&descs); move(&types); move(&invites); move(&requests); move(&restore)
+            history.removeAll { $0.room == room }  // sealed to the old name: they'd no longer open
+            var told = (invites[new] ?? []).union(requests[new] ?? [])
+            for (cid, var o) in clients where o.rooms.remove(room) != nil {
+                o.rooms.insert(new)
+                o.nicks[new] = o.nicks.removeValue(forKey: room)
+                clients[cid] = o
+                told.insert(cid)
+            }
+            for cid in told { clients[cid]?.send(Msg(t: "renamed", room: room, text: new)) }
+            send(Msg(t: "note", room: new, text: "\(c.name) renamed #\(room) to #\(new)"), to: new)
+            members(new)
+            roomList()
+
+        case "desc":  // one line about the room, for people browsing
+            guard room != "public", c.rooms.contains(room) else { return note("descriptions are for rooms: /join one first") }
+            let t = String((m.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines).prefix(80))
+            descs[room] = t.isEmpty ? nil : t
+            roomList()
+            send(Msg(t: "note", room: room, text: t.isEmpty ? "\(c.name) cleared the description" : "\(c.name) described the room: \(t)"), to: room)
+
+        case "pass":  // a type that ignores passwords (0, 3): ask which type should use it
+            guard room != "public", c.rooms.contains(room) else { return note("/join the room to change it") }
+            guard let p = m.text, (1...64).contains(p.count) else { return note("/room set password [new]", room) }
+            passwords[room] = p
+            send(Msg(t: "note", room: room, text: "\(c.name) changed the password"), to: room)
+            if types[room] != 1 && types[room] != 2 { c.send(Msg(t: "asktype", room: room)) }
+
+        case "type":  // a type that needs a password, and there's none yet: ask for one
+            guard room != "public", c.rooms.contains(room) else { return note("/join the room to change it") }
+            guard let k = Int(m.text ?? ""), typeNames.indices.contains(k) else { return note("types: " + typeList, room) }
+            types[room] = k
+            if k == 1 { invites[room] = nil; requests[room] = nil }  // password only: earlier invites and requests no longer count
+            roomList()
+            send(Msg(t: "note", room: room, text: "\(c.name) made the room \(typeNames[k])"), to: room)
+            if k == 1 || k == 2, passwords[room] == nil { c.send(Msg(t: "askpass", room: room)) }
 
         default: break
         }
@@ -754,6 +1030,9 @@ final class Server {
         var s = Snapshot()
         for (room, owner) in owners {
             var r = restore[room] ?? Snapshot.Room()  // people not back yet after a takeover stay in the copy
+            r.pass = passwords[room]
+            r.desc = descs[room]
+            r.type = types[room]
             if let o = clients[owner] { r.owner = o.name }
             for c in clients.values where c.rooms.contains(room) && !c.key.isEmpty {
                 r.members[c.name] = c.key
@@ -780,7 +1059,10 @@ final class Server {
     func takeOver() {
         let now = Date().timeIntervalSince1970
         guard now - lastRep < 60 else { restore = [:]; return }
-        for room in restore.keys where owners[room] == nil { owners[room] = -1 }
+        for (room, r) in restore where owners[room] == nil {
+            owners[room] = -1; passwords[room] = r.pass; descs[room] = r.desc
+            types[room] = r.type ?? (r.pass == nil ? 0 : 2)  // from an older host: a password meant type 2
+        }
         tookOver = now
         roomList()
     }
@@ -810,8 +1092,13 @@ final class Server {
 
     /// Everyone sees which private rooms exist and how full they are, so they can ask to join.
     func roomList() {
-        let counts = roomCounts()
-        for c in clients.values { c.send(Msg(t: "rooms", counts: counts)) }
+        let m = roomsMsg()
+        for c in clients.values { c.send(m) }
+    }
+
+    /// names: rooms that take a password (what older Psst reads); types: every room's type.
+    func roomsMsg() -> Msg {
+        Msg(t: "rooms", names: types.filter { $0.value == 1 || $0.value == 2 }.keys.sorted(), counts: roomCounts(), descs: descs, types: types)
     }
 
     func send(_ m: Msg, to room: String) {
@@ -886,6 +1173,8 @@ final class Panel: NSPanel {
 
 /// Blurred bubble. Dragging it moves the overlay unless locked; right-click shows its menu.
 final class Flipped: NSView { override var isFlipped: Bool { true } }  // top-down scroll content
+final class Row: NSView { var ts = 0.0 }  // a feed row, kept in time order
+let barWidth: CGFloat = 380  // the chat bar, and the feed column above it
 
 final class Bubble: NSVisualEffectView {
     override func acceptsFirstMouse(for e: NSEvent?) -> Bool { true }
@@ -931,9 +1220,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     var me = "", room = "public", via = "", roster: [String] = [], rooms: Set<String> = [], invited: Set<String> = []
     let status = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     let stack = NSStackView(), field = NSTextField(), hintLabel = NSTextField(wrappingLabelWithString: "")
+    let feedDoc = Flipped()
+    var seen = Set<String>()  // messages already shown (time + sender), so a replay never repeats one
+    var history: Bool { d.bool(forKey: "history") }  // /history on: messages stay and the feed scrolls back
     let grip = NSImageView(), ctx = NSMenu()
     var feed: Panel!, input: Panel!, hints: Panel!
     var suggestions: [Suggestion] = [], pick = 0
+    var menu: (source: String, path: [String])?  // open menu: the typed text that lists it, then the rows picked into
     var hotKey: EventHotKeyRef?
     var settings: NSWindow?
     let box = NSStackView(), welcomeText = NSTextField(wrappingLabelWithString: "")
@@ -942,6 +1235,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     let nameField = NSTextField(), nameNote = NSTextField(wrappingLabelWithString: "")
     let lockBox = NSButton(checkboxWithTitle: "Lock overlay position", target: nil, action: nil)
     let loginBox = NSButton(checkboxWithTitle: "Open Psst at login", target: nil, action: nil)
+    let updateBox = NSButton(checkboxWithTitle: "Install automatically, checking", target: nil, action: nil)
     let saveButton = NSButton(title: "Save", target: nil, action: nil)
     let shortcutButton = NSButton(title: "", target: nil, action: nil)
     var recorder: Any?  // key monitor while a new shortcut is being typed
@@ -958,6 +1252,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     var members: [String: [String: String]] = [:]  // private room -> member name -> public key
     var changed: [String: String] = [:]      // name -> new key that doesn't match the remembered one
     var openRooms: [String: Int] = [:]       // private rooms on the network -> people in each
+    var locked: Set<String> = []             // rooms that take a password
+    var roomDescs: [String: String] = [:]    // room -> description
+    var roomTypes: [String: Int] = [:]       // room -> who can get in (see typeNames)
+    var asks: [String: [Suggestion]] = [:]   // questions asked as a menu: title -> answers
+    var pics: [String: String] = [:]        // name -> profile picture (see validPic)
+    let picPreview = NSImageView()
     var requests: [String: [String]] = [:]   // room -> people asking to join, latest last
     var lastAsked: String?                   // room of the latest request, for a bare /accept elsewhere
     var nicks: [String: [String: String]] = [:]  // room -> name -> nickname there
@@ -973,13 +1273,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     func applicationDidFinishLaunching(_ n: Notification) {
         let f = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 800, height: 600)
         d.register(defaults: ["cooldown": 10.0, "retention": 600.0, "invisible": false, "invites": "everyone",
-                              "color": "auto", "hotKeyCode": kVK_Space, "hotKeyMods": optionKey, "hotKeyLabel": "⌥Space",
+                              "color": "auto", "picKind": "none", "history": false, "autoUpdate": true, "updateEvery": 86400.0, "hotKeyCode": kVK_Space, "hotKeyMods": optionKey, "hotKeyLabel": "⌥Space",
                               "x": f.minX + 12, "y": f.minY + 12])
         buildUI()
         registerHotKey()
         if name == nil { showSettings(welcome: true) }  // first launch: pick a username before anything connects
-        checkForUpdate()
-        Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { [weak self] _ in self?.checkForUpdate() }
+        updateIfDue()
+        Timer.scheduledTimer(withTimeInterval: 600, repeats: true) { [weak self] _ in self?.updateIfDue() }
         Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in self?.regroup() }
         let ws = NSWorkspace.shared.notificationCenter
         ws.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in self?.sleptAt = Date() }
@@ -1004,21 +1304,32 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         status.menu = menu
         ctx.delegate = self  // right-click menu on the overlay, filled in menuNeedsUpdate
 
-        feed = Panel(.zero)  // sized to its bubbles, so empty space never catches clicks
+        feed = Panel(NSRect(x: 0, y: 0, width: barWidth, height: 1))  // a column over the chat bar; mine on its right
         feed.canKey = false
         feed.delegate = self
+        feed.acceptsMouseMovedEvents = true
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 4
+        stack.spacing = 6
         stack.translatesAutoresizingMaskIntoConstraints = false
-        let fc = feed.contentView!
-        fc.addSubview(stack)
+        feedDoc.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: fc.leadingAnchor),
-            stack.bottomAnchor.constraint(equalTo: fc.bottomAnchor),
-            stack.trailingAnchor.constraint(lessThanOrEqualTo: fc.trailingAnchor),
+            stack.leadingAnchor.constraint(equalTo: feedDoc.leadingAnchor),
+            stack.topAnchor.constraint(equalTo: feedDoc.topAnchor),
+            stack.widthAnchor.constraint(equalToConstant: barWidth),
         ])
+        let scroll = NSScrollView(frame: feed.contentView!.bounds)  // scrolls back once /history is on
+        scroll.autoresizingMask = [.width, .height]
+        scroll.drawsBackground = false
+        scroll.contentView.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.scrollerStyle = .overlay
+        scroll.verticalScrollElasticity = .none
+        scroll.documentView = feedDoc
+        feed.contentView!.addSubview(scroll)
         feed.orderFrontRegardless()
+        _ = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .scrollWheel]) { [weak self] _ in self?.updateClickThrough() }
+        _ = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .scrollWheel]) { [weak self] e in self?.updateClickThrough(); return e }
 
         input = Panel(NSRect(x: 0, y: 0, width: 380, height: 28))
         input.delegate = self
@@ -1026,13 +1337,18 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         field.drawsBackground = false
         field.focusRingType = .none
         field.font = .systemFont(ofSize: 13)
-        field.cell?.usesSingleLineMode = true
+        field.cell?.wraps = true  // long messages wrap and the bar grows (fitInput); Shift+Enter starts a new line
+        field.cell?.isScrollable = false
+        field.lineBreakMode = .byWordWrapping
         field.delegate = self
         grip.image = NSImage(systemSymbolName: "line.3.horizontal", accessibilityDescription: "Drag to move")
         grip.contentTintColor = .tertiaryLabelColor
         grip.setContentHuggingPriority(.required, for: .horizontal)
         let row = NSStackView(views: [grip, field])
         row.spacing = 6
+        field.topAnchor.constraint(equalTo: row.topAnchor).isActive = true  // the field fills the bar as it grows
+        field.bottomAnchor.constraint(equalTo: row.bottomAnchor).isActive = true
+        field.setContentHuggingPriority(.defaultLow, for: .vertical)  // or it would shrink the bar to one line
         let p = pill(row)
         p.menu = ctx
         p.frame = input.contentView!.bounds
@@ -1081,13 +1397,24 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
 
     func layout() {
         input.setFrameOrigin(anchor)
-        hints.setFrameOrigin(NSPoint(x: anchor.x, y: anchor.y + 32))
-        feed.setFrameOrigin(NSPoint(x: anchor.x, y: anchor.y + 36))
+        hints.setFrameOrigin(NSPoint(x: anchor.x, y: anchor.y + input.frame.height + 4))
+        feed.setFrameOrigin(NSPoint(x: anchor.x, y: anchor.y + input.frame.height + 8))
+    }
+
+    /// The chat bar grows with what's typed (up to ~8 lines), so a long message shows whole instead of scrolling sideways.
+    func fitInput() {
+        let t = field.stringValue, cell = field.cell!.copy() as! NSCell
+        cell.stringValue = t.isEmpty || t.hasSuffix("\n") ? t + " " : t  // a new line just started counts
+        let h = cell.cellSize(forBounds: NSRect(x: 0, y: 0, width: field.bounds.width, height: 10000)).height
+        let height = min(max(28, ceil(h) + 10), 150)
+        guard abs(input.frame.height - height) > 0.5 else { return }
+        input.setFrame(NSRect(origin: anchor, size: NSSize(width: barWidth, height: height)), display: true)
+        layout()
     }
 
     func windowDidMove(_ n: Notification) {
         guard let w = n.object as? NSWindow, w === feed || w === input else { return }
-        let a = w === feed ? NSPoint(x: w.frame.minX, y: w.frame.minY - 36) : w.frame.origin
+        let a = w === feed ? NSPoint(x: w.frame.minX, y: w.frame.minY - input.frame.height - 8) : w.frame.origin
         guard a != anchor else { return }
         anchor = a
         layout()
@@ -1095,7 +1422,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
 
     func applyLock() {
         let locked = d.bool(forKey: "locked")
-        feed.ignoresMouseEvents = locked  // locked = messages are click-through
+        updateClickThrough()  // locked = messages are click-through
         grip.isHidden = locked
     }
 
@@ -1114,19 +1441,88 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
 
     func show(_ text: String, dim: Bool = false) { show(styled(text, dim: dim)) }
 
-    func show(_ text: NSAttributedString) {
+    /// A note from Psst or the host: a plain bubble on the left.
+    func show(_ text: NSAttributedString) { addRow(bubble(text), mine: false, ts: Date().timeIntervalSince1970) }
+
+    /// A chat message: the name (and picture, if they set one) above the bubble on the left; mine on the right, tinted.
+    func showMessage(_ m: Msg, text: NSAttributedString) {
+        let from = m.from ?? "?", mine = from == me, r = m.room ?? "public"
+        let col = NSStackView()
+        col.orientation = .vertical
+        col.alignment = mine ? .trailing : .leading
+        col.spacing = 2
+        let head = NSMutableAttributedString()
+        if !mine { head.append(NSAttributedString(string: m.nick ?? from, attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .semibold), .foregroundColor: nameColor(from, m.color)])) }
+        if r != "public" { head.append(NSAttributedString(string: (mine ? "" : " · ") + "#" + r, attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor])) }
+        if head.length > 0 { col.addArrangedSubview(NSTextField(labelWithAttributedString: head)) }
+        col.addArrangedSubview(bubble(text, tint: mine))
+        var views: [NSView] = [col]
+        if !mine, let img = pics[from].flatMap({ avatarImage($0, name: from, color: nameColor(from, m.color)) }) {
+            let v = NSImageView(image: img)
+            v.widthAnchor.constraint(equalToConstant: 22).isActive = true
+            v.heightAnchor.constraint(equalToConstant: 22).isActive = true
+            views.insert(v, at: 0)
+        }
+        let line = NSStackView(views: views)
+        line.alignment = .bottom
+        line.spacing = 6
+        addRow(line, mine: mine, ts: m.ts ?? Date().timeIntervalSince1970)
+    }
+
+    func bubble(_ text: NSAttributedString, tint: Bool = false) -> Bubble {
         let label = NSTextField(wrappingLabelWithString: "")
         label.attributedStringValue = text
         label.isSelectable = false
-        label.preferredMaxLayoutWidth = 340
-        let row = pill(label)
-        row.menu = ctx
-        stack.addArrangedSubview(row)
-        while stack.arrangedSubviews.count > 8 { drop(stack.arrangedSubviews[0]) }
-        fitFeed()
-        DispatchQueue.main.asyncAfter(deadline: .now() + d.double(forKey: "cooldown")) { [weak self] in
-            NSAnimationContext.runAnimationGroup({ $0.duration = 0.5; row.animator().alphaValue = 0 }) { self?.drop(row) }
+        label.preferredMaxLayoutWidth = 300
+        let b = pill(label)
+        b.menu = ctx
+        if tint {  // mine: the accent color through the blur
+            let t = NSView(frame: b.bounds)
+            t.autoresizingMask = [.width, .height]
+            t.wantsLayer = true
+            t.layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.45).cgColor
+            b.addSubview(t, positioned: .below, relativeTo: nil)
         }
+        return b
+    }
+
+    /// Adds a feed row in time order, so history replayed from the host slots in above newer rows.
+    func addRow(_ content: NSView, mine: Bool, ts: Double) {
+        let row = Row()
+        row.ts = ts
+        content.translatesAutoresizingMaskIntoConstraints = false
+        row.addSubview(content)
+        NSLayoutConstraint.activate([
+            content.topAnchor.constraint(equalTo: row.topAnchor),
+            content.bottomAnchor.constraint(equalTo: row.bottomAnchor),
+            mine ? content.trailingAnchor.constraint(equalTo: row.trailingAnchor) : content.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            mine ? content.leadingAnchor.constraint(greaterThanOrEqualTo: row.leadingAnchor)
+                 : content.trailingAnchor.constraint(lessThanOrEqualTo: row.trailingAnchor),
+        ])
+        let rows = stack.arrangedSubviews
+        stack.insertArrangedSubview(row, at: rows.firstIndex { (($0 as? Row)?.ts ?? 0) > ts } ?? rows.count)
+        row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        while stack.arrangedSubviews.count > (history ? 300 : 8) { drop(stack.arrangedSubviews[0]) }
+        fitFeed()
+        if !history { fade(row) }
+    }
+
+    func fade(_ row: NSView) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + d.double(forKey: "cooldown")) { [weak self, weak row] in
+            guard let self, let row, !self.history else { return }  // history turned on meanwhile: it stays
+            NSAnimationContext.runAnimationGroup({ $0.duration = 0.5; row.animator().alphaValue = 0 }) { [weak self] in self?.drop(row) }
+        }
+    }
+
+    /// /history on: every message stays and the feed scrolls back. Off: back to fading, newest few first.
+    func setHistory(_ on: Bool) {
+        d.set(on, forKey: "history")
+        if !on {
+            stack.arrangedSubviews.dropLast(8).forEach(drop)
+            stack.arrangedSubviews.forEach(fade)
+        }
+        fitFeed()
+        show(on ? "history on: messages stay; scroll up for older ones" : "history off: messages fade again", dim: true)
     }
 
     func drop(_ v: NSView) {
@@ -1135,9 +1531,27 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         fitFeed()
     }
 
+    /// The feed grows upward with its rows up to a cap, then scrolls. It stays at the newest unless you scrolled up.
     func fitFeed() {
-        let s = stack.fittingSize
-        feed.setFrame(NSRect(origin: feed.frame.origin, size: NSSize(width: max(s.width, 1), height: max(s.height, 1))), display: true)
+        let h = stack.fittingSize.height, shown = max(min(h, history ? 320 : 480), 1)
+        let atEnd = feedDoc.visibleRect.maxY >= feedDoc.frame.height - 4
+        feedDoc.frame = NSRect(x: 0, y: 0, width: barWidth, height: h)
+        feed.setFrame(NSRect(x: feed.frame.minX, y: feed.frame.minY, width: barWidth, height: shown), display: true)
+        if atEnd || !history { feedDoc.scroll(NSPoint(x: 0, y: max(h - shown, 0))) }
+        updateClickThrough()
+    }
+
+    /// The feed is a full-width column, but only its bubbles take the mouse (to drag, or right-click); the rest is
+    /// click-through to whatever is behind. With history on it takes the mouse anywhere over it, to scroll.
+    func updateClickThrough() {
+        let p = NSEvent.mouseLocation
+        var over = feed.frame.contains(p) && (history || !d.bool(forKey: "locked"))
+        if over, !history {
+            var v = feed.contentView?.hitTest(feed.convertPoint(fromScreen: p))
+            while let x = v, !(x is Bubble) { v = x.superview }
+            over = v != nil
+        }
+        if feed.ignoresMouseEvents == over { feed.ignoresMouseEvents = !over }
     }
 
     // MARK: Input + typing guide
@@ -1151,7 +1565,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         updateHints()
     }
 
-    func hideInput() {
+    func hideInput() {  // an open menu stays for next time: only Esc closes it
         input.orderOut(nil)
         hints.orderOut(nil)
     }
@@ -1164,7 +1578,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     }
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy sel: Selector) -> Bool {
-        let open = !suggestions.isEmpty
+        let open = !suggestions.isEmpty, row = open ? suggestions[pick] : nil, text = field.stringValue
         switch sel {
         case #selector(NSResponder.moveUp(_:)) where open:
             pick = (pick + suggestions.count - 1) % suggestions.count
@@ -1173,19 +1587,42 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
             pick = (pick + 1) % suggestions.count
             updateHints()
         case #selector(NSResponder.insertTab(_:)) where open:
-            accept()
+            if row!.sub != nil { pickInto(row!) } else { accept() }
+        case #selector(NSResponder.insertNewline(_:)) where NSApp.currentEvent?.modifierFlags.contains(.shift) == true:
+            textView.insertNewlineIgnoringFieldEditor(nil)  // Shift+Enter: a new line in the message
         case #selector(NSResponder.insertNewline(_:)):
-            let text = open && suggestions[pick].run ? suggestions[pick].replace : field.stringValue
-            if open, !suggestions[pick].run, suggestions[pick].replace != text { accept(); break }
-            field.stringValue = ""
-            submit(text)
+            if let row, row.sub != nil { pickInto(row); break }  // a person or room: what to do with them
+            if let row, !row.run, row.replace != text { accept(); break }  // emoji, #room, a password still to type
+            field.stringValue = ""  // commands go like messages: sent, and the field is empty again
+            submit(row?.run == true ? row!.replace.trimmingCharacters(in: .whitespaces) : text)
             updateHints()
         case #selector(NSResponder.cancelOperation(_:)):
-            if open { suggestions = []; hints.orderOut(nil) } else { hideInput() }
+            if !text.isEmpty, open { suggestions = []; hints.orderOut(nil) }  // typing: put the guide away
+            else if menu != nil, text.isEmpty {  // menus close only here, a level at a time
+                if menu!.path.isEmpty { menu = nil } else {
+                    let back = menu!.path.removeLast()  // highlight who we came from, wherever they are in the list now
+                    pick = menuRows(menu!.source, menu!.path, guide).rows.firstIndex { $0.label == back } ?? 0
+                }
+                updateHints()
+            } else { hideInput() }
         default:
             return false
         }
         return true
+    }
+
+    /// Opens a command's list as a menu (see listMenu).
+    func openList(_ source: String) {
+        (menu, pick) = ((source, []), 0)
+        updateHints()
+    }
+
+    /// Opens the picked row's menu: in a menu, one level down; while typing, the list it came from with this row open.
+    func pickInto(_ row: Suggestion) {
+        if menu != nil, field.stringValue.isEmpty { menu!.path.append(row.label) }
+        else { (menu, field.stringValue) = ((row.replace, [row.label]), "") }
+        pick = 0
+        updateHints()
     }
 
     func accept() {
@@ -1199,13 +1636,20 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         Ctx(me: me, room: room, roster: roster, friends: friends, blocked: blocked, changed: changed.keys.sorted(),
             joined: ["public"] + rooms.subtracting(["public"]).sorted(), invited: invited.sorted(), open: openRooms,
             members: room == "public" ? roster : (members[room] ?? [:]).keys.sorted(), nicks: nicks[room] ?? [:],
-            requests: requests[room] ?? [])
+            requests: requests[room] ?? [], locked: locked.sorted(), descs: roomDescs, types: roomTypes, asks: asks)
     }
 
     func updateHints() {
-        suggestions = suggest(field.stringValue, guide)
-        let guide = paramGuide(field.stringValue)
-        guard input.isVisible, !suggestions.isEmpty || guide != nil else { return hints.orderOut(nil) }
+        fitInput()
+        let typed = field.stringValue, inMenu = menu != nil && typed.isEmpty  // typing shows the guide; the menu waits
+        var title: Suggestion?
+        if inMenu {
+            let r = menuRows(menu!.source, menu!.path, guide)
+            menu!.path = Array(menu!.path.prefix(r.depth))  // a picked row that's gone: back up
+            (suggestions, title) = (r.rows, r.title)
+        } else { suggestions = suggest(typed, guide) }
+        let format = inMenu ? nil : paramGuide(typed, guide)
+        guard input.isVisible, inMenu || !suggestions.isEmpty || format != nil else { return hints.orderOut(nil) }
         pick = min(pick, max(suggestions.count - 1, 0))
         let s = NSMutableAttributedString()
         // Columns: ▸ marker | label (+ dot) | detail. Wrapped lines stay under their column instead of the left edge.
@@ -1220,12 +1664,23 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         head.firstLineHeadIndent = indent
         head.headIndent = indent
         head.paragraphSpacing = 2
-        if let guide {  // command format, the parameter being typed in accent color
-            let line = NSMutableAttributedString(attributedString: styled(guide.label, dim: true))
-            if let r = guide.label.range(of: guide.focus) {
-                line.addAttributes([.foregroundColor: NSColor.controlAccentColor, .font: bold], range: NSRange(r, in: guide.label))
+        if inMenu {  // the list's command, or the picked person or room; then the way out
+            let line = NSMutableAttributedString(attributedString: styled(title?.label ?? menu!.source.trimmingCharacters(in: .whitespaces), bold: true))
+            if let on = title?.dot { line.append(styled(on ? " ●" : " ○", color: on ? .systemGreen : .tertiaryLabelColor)) }
+            line.append(styled(title == nil ? "   esc to close" : "   esc to go back", dim: true))
+            line.addAttribute(.paragraphStyle, value: head, range: NSRange(location: 0, length: line.length))
+            s.append(line)
+        } else if let format {  // command format, the parameter being typed in accent color
+            let line = NSMutableAttributedString(attributedString: styled(format.label, dim: true))
+            if let r = format.label.range(of: format.focus) {
+                line.addAttributes([.foregroundColor: NSColor.controlAccentColor, .font: bold], range: NSRange(r, in: format.label))
             }
-            line.append(styled("   " + guide.help, dim: true))
+            var at = format.label.startIndex  // red star: a required parameter
+            while let r = format.label.range(of: "]*", range: at..<format.label.endIndex) {
+                line.addAttributes([.foregroundColor: NSColor.systemRed, .font: bold], range: NSRange(format.label.index(before: r.upperBound)..<r.upperBound, in: format.label))
+                at = r.upperBound
+            }
+            line.append(styled("   " + format.help, dim: true))
             line.addAttribute(.paragraphStyle, value: head, range: NSRange(location: 0, length: line.length))
             s.append(line)
         }
@@ -1235,7 +1690,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
             body.append(styled((i == pick ? "▸" : "") + "\t" + g.label, dim: i != pick, bold: i == pick))
             if let on = g.dot { body.append(styled(on ? " ●" : " ○", color: on ? .systemGreen : .tertiaryLabelColor)) }
             if !g.detail.isEmpty { body.append(styled("\t" + g.detail, dim: true)) }
+            if i == pick, !inMenu, g.sub == nil, g.replace != typed { body.append(styled("  ⇥ tab", color: .tertiaryLabelColor)) }  // Tab completes
         }
+        if inMenu, suggestions.isEmpty { body.append(styled("\n\tno one here", dim: true)) }
         if pages > 1 { body.append(styled("\n\tpage \(start / per + 1) of \(pages) · ↑↓", dim: true)) }
         body.addAttribute(.paragraphStyle, value: rows, range: NSRange(location: 0, length: body.length))
         s.append(body)
@@ -1256,6 +1713,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         let parts = s.split(separator: " ", maxSplits: 1).map(String.init)
         let arg = parts.count > 1 ? parts[1] : ""
         func note(_ text: String) { show(text, dim: true) }
+        if let m = menu, asks[m.source]?.contains(where: { $0.replace == s }) == true { (asks[m.source], menu) = (nil, nil) }  // answered
+        if let list = listMenu(s), !suggest(list, guide).isEmpty { return openList(list) }  // empty: say so in words below
         if s.hasPrefix("#") {  // "#room message": switch to that room and send there
             let r = clean(String(parts[0].dropFirst()), lower: true)
             if r == "public" || rooms.contains(r) {
@@ -1267,6 +1726,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         switch parts[0] {  // these work without a host
         case "/quit": return NSApp.terminate(nil)
         case "/settings": return showSettings(welcome: false)
+        case "/history":  // on: every message stays and the feed scrolls back; off: they fade. Bare: switch
+            let on = arg.isEmpty ? !history : arg.lowercased() == "on"
+            setHistory(on)
+            if on { line?.send(Msg(t: "history", room: room)) }  // what the host still has, slotted in by time
+            return
         case "/friend": return note(friend(arg))
         case "/block":
             let who = clean(arg)
@@ -1288,21 +1752,38 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         }
         guard let line, !me.isEmpty else { return note("not connected yet: looking for other Macs running Psst") }
         switch parts[0] {
-        case "/room" where arg.isEmpty: note("#\(room): " + guide.members.joined(separator: ", "))
-        case "/room": line.send(Msg(t: "create", room: arg))
-        case "/rooms": note(openRooms.isEmpty ? "no rooms yet. /room <room name> makes one" : "rooms: " + openRooms.keys.sorted().map { "#" + $0 }.joined(separator: ", "))
-        case "/join":
-            let r = arg.isEmpty ? "public" : clean(arg, lower: true)
+        case "/room":  // create [room name] [desc] [type] · [room name] set [name|desc|password|type] [new] · members
+            let what = arg.split(separator: " ").first?.lowercased() ?? ""
+            if what == "create" {
+                let a = createArgs(String(arg.dropFirst(6)))
+                guard !a.room.isEmpty else { return note("/room create [room name] [desc] [type]") }
+                guard !reservedRooms.contains(a.room) else { return note("#\(a.room) can't be a room name") }
+                return line.send(Msg(t: "create", room: a.room, descs: a.desc.isEmpty ? nil : [a.room: a.desc], types: [a.room: a.type]))
+            }
+            if what == "members" || what.isEmpty { return note("#\(room): " + guide.members.joined(separator: ", ")) }
+            guard let e = roomEdit(arg, current: room) else {
+                return note("/room create [room name] · /room [room name] set [name|desc|password|type] [new] · /room members")
+            }
+            switch e.field {
+            case "name": line.send(Msg(t: "rename", room: e.room, text: clean(e.value, lower: true)))
+            case "desc": line.send(Msg(t: "desc", room: e.room, text: unquote(Substring(e.value))))
+            case "password" where !e.value.isEmpty: line.send(Msg(t: "pass", room: e.room, text: roomPass(e.value)))
+            case "type" where Int(e.value).map(typeNames.indices.contains) == true: line.send(Msg(t: "type", room: e.room, text: e.value))
+            case "type": note("types: " + typeList)
+            default: note("/room [room name] set [name|desc|password|type] [new]")
+            }
+        case "/browse": note(openRooms.isEmpty ? "No rooms yet. /room create [room name] to make a room." : "rooms: " + openRooms.keys.sorted().map { "#" + $0 }.joined(separator: ", "))
+        case "/join":  // /join [room name] [password]
+            let w = arg.split(separator: " ", maxSplits: 1).map(String.init), r = w.isEmpty ? "public" : clean(w[0], lower: true)
             if r == "public" || rooms.contains(r) { setRoom(r); note("now in #\(r)") }  // already in: just switch
-            else { line.send(Msg(t: "join", room: r)) }
+            else { line.send(Msg(t: "join", room: r, text: w.count > 1 ? roomPass(w[1]) : nil)) }
         case "/request": line.send(Msg(t: "request", room: arg))
         case "/accept":  // this room if anyone is asking here, else the room of the latest request
             line.send(Msg(t: "accept", room: requests[room]?.isEmpty == false ? room : lastAsked ?? room, text: arg))
         case "/nick": line.send(Msg(t: "alias", room: room, text: arg))
         case "/invite": line.send(Msg(t: "invite", room: room, text: arg))
         case "/leave": line.send(Msg(t: "leave", room: room))
-        case "/history": line.send(Msg(t: "history", room: room))
-        case "/status": note(arg.isEmpty ? "online: " + roster.joined(separator: ", ") : "no one online named \(arg)")
+        case "/status": note(arg.isEmpty ? "online: " + roster.joined(separator: ", ") : roster.contains(clean(arg)) ? "\(clean(arg)) is online" : "no one online named \(arg)")
         case _ where s.hasPrefix("/"): show(commands.map(usage).joined(separator: " · "), dim: true)
         default:
             let color = d.string(forKey: "color")
@@ -1317,6 +1798,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     // MARK: Connection
 
     func got(_ m: Msg) {
+        defer { if menu != nil { updateHints() } }  // an open menu shows who's online now
         let r = m.room ?? "public", tag = r == "public" ? "" : "#\(r) ", from = m.from ?? "?"
         if blocked.contains(from), m.t == "say" || m.t == "invite" || m.t == "request" { return }
         switch m.t {
@@ -1336,16 +1818,37 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
             nicks[r] = m.nicks ?? [:]
             requests[r]?.removeAll { m.keys?[$0] != nil }  // let in already
             learn(m.keys ?? [:])
-        case "rooms": openRooms = m.counts ?? [:]
+        case "pic": pics[from] = validPic(m.pic).isEmpty ? nil : m.pic  // checked again: any Mac can host
+        case "rooms": openRooms = m.counts ?? [:]; locked = Set(m.names ?? []); roomDescs = m.descs ?? [:]; roomTypes = m.types ?? [:]
+        case "askpass":  // a room of mine takes a password and has none: start the command for it
+            show("#\(r) needs a password: type it and press Enter", dim: true)
+            if field.stringValue.isEmpty {
+                field.stringValue = "/room \(r) set password "
+                field.currentEditor()?.selectedRange = NSRange(location: (field.stringValue as NSString).length, length: 0)
+                updateHints()
+            }
+        case "asktype":  // a password on a room whose type ignores it: which type should use it
+            let q = "#\(r) has a password now. Convert to which type?"
+            asks[q] = [1, 2].map { Suggestion(label: "\($0)", detail: typeNames[$0], replace: "/room \(r) set type \($0)", run: true) }
+            openList(q)
         case "request":
             requests[r, default: []].removeAll { $0 == from }
             requests[r, default: []].append(from)
             lastAsked = r
-            show("#\(r) \(from) is requesting to join. Do /accept to accept.")
+            show("#\(r) \(from) is requesting to join. Type /accept to accept.")
         case "joined":  // "restored": back in a room after the host changed; stay in the room we were in
             rooms.insert(r)
             invited.remove(r)
             if m.text != "restored" || r == prevRoom { setRoom(r) }
+        case "renamed":  // a room I'm in, invited to or asking to join has a new name
+            let new = m.text ?? r
+            func move<T>(_ d: inout [String: T]) { if let v = d.removeValue(forKey: r) { d[new] = v } }
+            if rooms.remove(r) != nil { rooms.insert(new) }
+            if invited.remove(r) != nil { invited.insert(new) }
+            move(&members); move(&nicks); move(&requests)
+            if lastAsked == r { lastAsked = new }
+            if prevRoom == r { prevRoom = new }
+            if room == r { setRoom(new) }
         case "left": rooms.remove(r); members[r] = nil; nicks[r] = nil; requests[r] = nil; if r == room { setRoom("public") }
         case "invite":
             let policy = d.string(forKey: "invites")
@@ -1355,16 +1858,14 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         case "note": show(tag + (m.text ?? ""), dim: true)
         case "say":
             lastSeen = max(lastSeen, m.ts ?? 0)
+            guard seen.insert("\(m.ts ?? 0) \(from)").inserted else { return }  // replays repeat what's on screen
             var text = m.text ?? ""
             if r != "public" {  // private: must open with the sender's trusted key, or it isn't shown
                 guard let ct = m.ct, let wrap = m.wraps?[me], let key = members[r]?[from] ?? known[from], pins[from] == key,
                       let opened = open(ct: ct, wrap: wrap, room: r, from: from, senderKey: key, with: identity) else { return }
                 text = opened
             }
-            let s = NSMutableAttributedString(attributedString: styled(tag, dim: true))
-            s.append(styled("\(m.nick ?? from): ", bold: true, color: nameColor(from, m.color)))
-            s.append(markdown(text))
-            show(s)
+            showMessage(m, text: markdown(text))
         default: break
         }
     }
@@ -1442,9 +1943,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     }
 
     /// A Mac that slept a while gave up its place: restarting its host makes it the newest, so people stay with
-    /// whoever took over instead of all moving back. Also a good moment to look for updates.
+    /// whoever took over instead of all moving back. Also a good moment to look for updates, if it's time.
     func onWake() {
-        checkForUpdate()
+        updateIfDue()
         if Date().timeIntervalSince(sleptAt ?? Date()) > 30 { startHost() }
     }
 
@@ -1472,6 +1973,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
             self.rooms = []
             self.invited = []
             self.openRooms = [:]
+            self.roomTypes = [:]
             self.requests = [:]
             self.nicks = [:]
             self.setRoom("public")
@@ -1479,7 +1981,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.connect() }
         }
         l.send(Msg(t: "hello", from: name, ts: lastSeen, hidden: d.bool(forKey: "invisible"), key: publicKey(identity),
-                   since: server?.since))
+                   since: server?.since, pic: myPic))
     }
 
     /// Every Mac hosts (see electHost). Restarting makes this one the newest host, e.g. after sleeping.
@@ -1509,7 +2011,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
             add("Reset position", #selector(resetPosition))
             return
         }
-        add(me.isEmpty ? "Looking for other Macs…" : "\(me) in #\(room) · \(via)")
+        add(me.isEmpty ? "Looking for other machines…" : "\(me) in #\(room) · \(via)")
         add("Write…   \(shortcut)", #selector(toggleInput))
         menu.addItem(.separator())
 
@@ -1526,13 +2028,23 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
 
     // MARK: Updates
 
+    /// With auto update on (Settings), looks once the chosen interval has passed since the last look, across restarts.
+    func updateIfDue() {
+        let now = Date().timeIntervalSince1970, last = d.double(forKey: "lastUpdateCheck")
+        guard d.bool(forKey: "autoUpdate"), now - last >= d.double(forKey: "updateEvery") || now < last else { return }  // now < last: clock moved back
+        d.set(now, forKey: "lastUpdateCheck")
+        checkForUpdate()
+    }
+
     func checkForUpdate() {
-        DispatchQueue.global().async {
+        var head = URLRequest(url: URL(string: repo + "/releases/latest")!)
+        head.httpMethod = "HEAD"
+        URLSession.shared.dataTask(with: head) { _, response, _ in  // the version is where it redirects: see tagVersion
+            guard let v = tagVersion(response?.url), isNewer(v, than: appVersion) else { return }
             func get(_ file: String) -> Data? { try? Data(contentsOf: URL(string: releases + file)!) }
-            guard let v = get("version.txt").map({ String(decoding: $0, as: UTF8.self) }), isNewer(v, than: appVersion),
-                  let zip = get("Psst.zip"), let sig = get("Psst.zip.sig") else { return }
+            guard let zip = get("Psst.zip"), let sig = get("Psst.zip.sig") else { return }
             DispatchQueue.main.async { self.install(zip, sig: sig) }
-        }
+        }.resume()
     }
 
     func install(_ zip: Data, sig: Data) {
@@ -1598,6 +2110,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         lockBox.action = #selector(lockChanged)
         loginBox.target = self
         loginBox.action = #selector(loginChanged)
+        updateBox.target = self
+        updateBox.action = #selector(updateBoxChanged)
         shortcutButton.target = self
         shortcutButton.action = #selector(recordShortcut)
         shortcutButton.title = shortcut
@@ -1607,13 +2121,20 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
             popup("cooldown", [("5 seconds", 5.0), ("10 seconds", 10.0), ("30 seconds", 30.0), ("1 minute", 60.0)]),
             popup("retention", [("1 minute", 60.0), ("10 minutes", 600.0), ("1 hour", 3600.0), ("1 day", 86400.0)]),
             popup("color", [("Auto", "auto")] + nameColors.map { ($0.name.capitalized, $0.name) }),
+            popup("picKind", [("None", "none"), ("Letters from my name", "letters"), ("Choose a picture…", "image")]),
+            popup("updateEvery", [("every hour", 3600.0), ("every 6 hours", 21600.0), ("every 12 hours", 43200.0), ("every day", 86400.0), ("every week", 604800.0)]),
         ]
+        picPreview.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        picPreview.heightAnchor.constraint(equalToConstant: 28).isActive = true
         for (item, c) in zip(popups[4].itemArray.dropFirst(), nameColors) { item.image = swatch(c.color) }
         func label(_ s: String) -> NSTextField { NSTextField(labelWithString: s) }
+        let updates = NSStackView(views: [updateBox, popups[6]])  // ☑ Install automatically, checking [every day]
+        updates.alignment = .firstBaseline
         let grid = NSGridView(views: [
             [label("Username"), NSStackView(views: [nameField, saveButton])],
             [NSGridCell.emptyContentView, nameNote],
             [label("Name color"), popups[4]],
+            [label("Profile picture"), NSStackView(views: [popups[5], picPreview])],
             [label("Chat shortcut"), shortcutButton],
             [label("Visibility"), popups[0]],
             [label("Room invites from"), popups[1]],
@@ -1621,8 +2142,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
             [label("When hosting, erase history after"), popups[3]],
             [NSGridCell.emptyContentView, lockBox],
             [NSGridCell.emptyContentView, loginBox],
+            [label("Updates"), updates],
         ])
         grid.column(at: 0).xPlacement = .trailing
+        grid.row(at: 3).rowAlignment = .none  // picture row: centered on the preview, not the popup's baseline
+        grid.row(at: 3).yPlacement = .center
         grid.rowAlignment = .firstBaseline
         grid.rowSpacing = 10
         welcomeText.preferredMaxLayoutWidth = grid.fittingSize.width  // wrap to the settings' width
@@ -1774,11 +2298,15 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
             p.selectItem(at: p.itemArray.firstIndex { ($0.representedObject as? NSObject)?.isEqual(current) == true } ?? 0)
         }
         lockBox.state = d.bool(forKey: "locked") ? .on : .off
+        updateBox.state = d.bool(forKey: "autoUpdate") ? .on : .off
+        popups[6].isEnabled = updateBox.state == .on
         if #available(macOS 13, *) { loginBox.state = SMAppService.mainApp.status == .enabled ? .on : .off } else {
             loginBox.isEnabled = false
             loginBox.title = "Open Psst at login (needs macOS 13; use System Preferences › Login Items)"
         }
         popups[4].itemArray.first?.image = swatch(nameColor(name ?? "", nil))  // what Auto gives this name
+        picPreview.image = avatarImage(myPic, name: name ?? "", color: nameColor(name ?? "", d.string(forKey: "color")), side: 28)
+        picPreview.isHidden = picPreview.image == nil
         shortcutButton.title = shortcut
     }
 
@@ -1826,10 +2354,42 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     }
 
     @objc func popupChanged(_ p: NSPopUpButton) {
-        let key = p.identifier!.rawValue
+        let key = p.identifier!.rawValue, old = d.object(forKey: key)
         d.set(p.selectedItem?.representedObject, forKey: key)
         if key == "retention" { server?.retention = d.double(forKey: key); server?.purge() }
-        if key == "invisible" { line?.send(Msg(t: "nick", from: name, hidden: d.bool(forKey: key), key: publicKey(identity))) }
+        if key == "invisible" { sendProfile() }
+        if key == "color" { refreshSettings() }  // the letters picture takes the name color
+        if key == "picKind" { picChanged(old: old) }
+    }
+
+    var myPic: String {  // what others see beside my messages
+        switch d.string(forKey: "picKind") {
+        case "letters": return "letters"
+        case "image": return d.data(forKey: "picData")?.base64EncodedString() ?? ""
+        default: return ""
+        }
+    }
+
+    func sendProfile() { line?.send(Msg(t: "nick", from: name, hidden: d.bool(forKey: "invisible"), key: publicKey(identity), pic: myPic)) }
+
+    /// "Choose a picture…" asks for an image; cancelling goes back to what was set before.
+    func picChanged(old: Any?) {
+        guard d.string(forKey: "picKind") == "image", let w = settings else { refreshSettings(); return sendProfile() }
+        let o = NSOpenPanel()
+        o.allowedContentTypes = [.image]
+        o.beginSheetModal(for: w) { [weak self] r in
+            guard let self else { return }
+            if r == .OK, let url = o.url, let img = NSImage(contentsOf: url), let jpg = squareJPEG(img) { self.d.set(jpg, forKey: "picData") }
+            else { self.d.set(old, forKey: "picKind") }
+            self.refreshSettings()
+            self.sendProfile()
+        }
+    }
+
+    @objc func updateBoxChanged() {
+        d.set(updateBox.state == .on, forKey: "autoUpdate")
+        popups[6].isEnabled = updateBox.state == .on
+        updateIfDue()
     }
 
     @objc func lockChanged() {
@@ -1883,18 +2443,18 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         guard name == nil || left == 0 else { return "You can change your name again in \(waitText(left))." }
         d.set(n, forKey: "name")
         d.set(Date(), forKey: "nameSetAt")
-        if let line { line.send(Msg(t: "nick", from: n, hidden: d.bool(forKey: "invisible"), key: publicKey(identity))) } else { connect() }
+        if line != nil { sendProfile() } else { connect() }
         return "Saved: you're \(n). \(shortcut) to chat. Next name change in 2 weeks."
     }
 
-    /// /friend <list|add|remove> <username>. Friends are kept on this Mac only.
+    /// /friend [list|add|remove] [username]. Friends are kept on this Mac only.
     func friend(_ arg: String) -> String {
         let w = arg.split(separator: " ").map(String.init)
         let who = w.count > 1 ? clean(w[1]) : ""
         switch (w.first ?? "list", who.isEmpty) {
         case ("list", _):
             let online = friends.filter(roster.contains)
-            return friends.isEmpty ? "no friends yet: /friend add <username>"
+            return friends.isEmpty ? "no friends yet: /friend add [username]"
                 : online.isEmpty ? "no friends online" : "friends online: " + online.joined(separator: ", ")
         case ("add", false):
             guard who != me, who != name else { return "that's you" }
@@ -1904,7 +2464,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
             friends.removeAll { $0 == who }
             return "removed \(who) from friends"
         default:
-            return "/friend list · /friend add <username> · /friend remove <username>"
+            return "/friend list · /friend add [username] · /friend remove [username]"
         }
     }
 
@@ -1967,14 +2527,53 @@ func selftest() {
 
     func hint(_ t: String, _ roster: [String] = [], _ rooms: [String] = []) -> [Suggestion] { suggest(t, Ctx(roster: roster, joined: rooms)) }
     check(hint("/").count == commands.count, "/ lists every command")
+    check(usage(commands[0]) == "/status [username]", "parameters in square brackets")
     check(hint("/inv").first?.replace == "/invite ", "command completes with room for its argument")
     check(hint("/invite a", ["ana", "bob"]).map(\.replace) == ["/invite ana"], "/invite suggests people")
     check(hint("/join m", [], ["math", "public"]).map(\.replace) == ["/join math"], "/join suggests rooms")
-    check(hint("/room ma").isEmpty, "free argument has nothing to pick")
-    check(paramGuide("/room ma")?.label == "/room <room name>" && paramGuide("/room ma")?.focus == "<room name>", "guide shows format")
-    check(paramGuide("/friend a")?.focus == "<list|add|remove>", "guide highlights first parameter")
-    check(paramGuide("/friend add b")?.focus == "<username>", "guide moves to second parameter")
-    check(paramGuide("/friend ")?.label == "/friend <list|add|remove> <username>", "one placeholder per parameter")
+    check(hint("/room create ma").isEmpty, "free argument has nothing to pick")
+    check(paramGuide("/room create ma")?.label == "/room create [room name]* [desc] [type]" && paramGuide("/room create ma")?.focus == "[room name]", "guide shows format")
+    check(usage(commands.first { $0.name == "/trust" }!) == "/trust [username]*" && paramGuide("/friend ")?.label == "/friend [list|add|remove]* [username]",
+          "a star marks required parameters")
+    let rc = Ctx(room: "art", joined: ["public", "art", "club"], open: ["art": 1, "club": 2], types: ["club": 2])
+    let g = { (t: String) in paramGuide(t, rc).map { "\($0.label) | \($0.focus) | \($0.help)" } ?? "nil" }
+    check(g("/room ") == "/room [create|set|members]* | [create|set|members] | make a room, change #art (or a room you name first), or see who's in it"
+          && suggest("/room ", rc).map(\.replace) == ["/room create ", "/room set ", "/room club set ", "/room "]
+          && suggest("/room cl", rc).map(\.replace) == ["/room club set "] && hint("/room ").map(\.label) == ["create", "members"],
+          "/room: an option, or a room to change: \(suggest("/room ", rc).map(\.replace))")
+    let set = "/room [room name] set [name|desc|password|type]* [new]*"
+    check(g("/room set name lounge") == "\(set) | [new] | renames #art to #lounge"
+          && g("/room club set name lounge") == "\(set) | [new] | renames #club to #lounge"
+          && g("/room current set name club") == "\(set) | [new] | #club is taken"
+          && g("/room cl") == "\(set) | [room name] | a room you're in, or current for #art"
+          && g("/room club") == "\(set) | [room name] | then set, to change #club"
+          && g("/room club ") == "\(set) |  | set, to change #club"
+          && g("/room zoo set name x") == "\(set) | [room name] | you're not in #zoo: /join it first", "set guide: \(g("/room club set name lounge"))")
+    check(g("/room set password x") == "\(set) | [new] | #art's new password · then pick type 1 or 2 so it's used"
+          && g("/room club set password x") == "\(set) | [new] | #club's new password"
+          && g("/room club set type ") == "\(set) | [new] | #club is now 2: invite or password"
+          && suggest("/room club set type ", rc).map { "\($0.label) \($0.detail)" } == ["0 invite only", "1 password only", "2 invite or password · now", "3 open access"]
+          && suggest("/room club set type ", rc).allSatisfy(\.run) && suggest("/room set ", rc).map(\.label) == ["name", "desc", "password", "type"],
+          "set: fields, then types to pick")
+    let cl = "/room create [room name]* [desc] [type]"
+    check(g("/room create club") == "\(cl) | [room name] | #club already exists: /join it instead"
+          && g("/room create current") == "\(cl) | [room name] | #current can't be a room name"
+          && g("/room create chess after school 1") == "\(cl) | [type] | 1: password only · you'll set the password next"
+          && g("/room create chess after") == "\(cl) | [desc] | optional: what #chess is about, for /browse · end with a type: \(typeList)",
+          "create guide: \(g("/room create chess after"))")
+    check(suggest("/room ", Ctx(joined: ["public", "club"])).map(\.label) == ["create", "members"]
+          && paramGuide("/room ", Ctx(joined: ["public", "club"]))?.label == "/room [create|members]*", "in public: no editing offered")
+    check(paramGuide("/room set name x", Ctx(joined: ["public"]))?.help == "#public can't be changed: name a room you're in", "no changing #public")
+    check(createArgs("chess after school 2") == ("chess", "after school", 2) && createArgs("Chess") == ("chess", "", 0)
+          && createArgs("chess \"grade 3\"") == ("chess", "grade 3", 0) && createArgs("chess 3") == ("chess", "", 3)
+          && createArgs("chess 9") == ("chess", "9", 0), "create: a last word 0–3 is the type")
+    let ed = { (a: String) in roomEdit(a, current: "art").map { "\($0.room)|\($0.field)|\($0.value)" } ?? "nil" }
+    check(ed("set name lounge") == "art|name|lounge" && ed("club set desc after school") == "club|desc|after school"
+          && ed("Current set TYPE 2") == "art|type|2" && ed("club lounge") == "nil" && ed("set") == "art||", "set: room name optional, current is this room")
+    check(suggest("#q?", Ctx(asks: ["#q?": [Suggestion(label: "1", replace: "x", run: true)]])).map(\.replace) == ["x"], "a question's answers")
+    check(unquote(" \"chess club\" ") == "chess club" && unquote("“quiet”") == "quiet" && unquote("plain words") == "plain words", "quotes optional")
+    check(paramGuide("/friend a")?.focus == "[list|add|remove]", "guide highlights first parameter")
+    check(paramGuide("/friend add b")?.focus == "[username]", "guide moves to second parameter")
     check(paramGuide("/leave ") == nil && paramGuide("/fri") == nil && paramGuide("hi") == nil, "no guide without parameters")
     check(hint("hi :fir").first?.replace == "hi 🔥", "emoji suggestions: \(hint("hi :fir").map(\.label))")
     check(hint("at 10:30").isEmpty && hint("a :x").isEmpty, "no emoji guide for times or 1 letter")
@@ -1989,16 +2588,31 @@ func selftest() {
                  invited: ["band"], open: ["club": 2, "art": 3, "band": 1], members: ["me", "zoe"], nicks: ["zoe": "Z"], requests: ["al", "bo"])
     let online = suggest("/status ", cx)
     check(online.map(\.label) == ["bo", "al", "me", "zoe"] && online.allSatisfy { $0.dot == true }, "status: friends first, all online")
-    check(online[0].detail == "friend" && online[2].detail == "you" && online[0].replace == "/status bo ", "status rows open a person")
+    check(online[0].detail == "friend" && online[2].detail == "you" && online.allSatisfy { $0.replace == "/status " && !$0.run },
+          "status rows open a menu and leave the typed text alone")
     check(suggest("/friend list ", cx).map { "\($0.label) \($0.dot!)" } == ["bo true", "gone false"], "friend list marks who is offline")
-    let acts = suggest("/status al ", cx)
+    let acts = online[1].sub ?? []  // al
     check(acts.map(\.replace) == ["/friend add al", "/invite al", "/block al", "/key al"] && acts.allSatisfy(\.run), "picking someone shows actions")
-    check(suggest("/status bo ", cx).first?.label == "remove friend", "friends can be removed")
-    check(!suggest("/room zoe ", cx).contains { $0.label.hasPrefix("invite") }, "no invite for people already here")
-    check(suggest("/room ", cx).map(\.label) == ["me", "Z · zoe"] && hint("/room ma").isEmpty, "room list shows nicknames; typing a name makes a room")
-    check(suggest("/rooms ", cx).map(\.replace) == ["/request art", "/join band", "/join club"] && suggest("/rooms ", cx).allSatisfy(\.run),
+    check(suggest("/friend list ", cx).first?.sub?.first?.replace == "/friend remove bo", "friend list: pick, then remove")
+    check(suggest("/friend list bo ", cx).isEmpty && suggest("/status al ", cx).isEmpty, "actions never go in the typed text")
+    check(!(suggest("/room members ", cx).last?.sub ?? []).contains { $0.label.hasPrefix("invite") }, "no invite for people already here")
+    check(suggest("/room members ", cx).map(\.label) == ["me", "Z · zoe"] && suggest("/room ", cx).last?.sub?.map(\.label) == ["me", "Z · zoe"]
+          && menuRows("/room ", ["members", "Z · zoe"], cx).depth == 2, "members: nicknames, a menu inside /room")
+    check(suggest("/browse ", cx).map(\.replace) == ["/request art", "/join band", "/join club"] && suggest("/browse ", cx).allSatisfy(\.run),
           "rooms: ask, or join when invited or already in")
     check(suggest("/accept ", cx).map(\.replace) == ["/accept bo", "/accept al", "/accept all"], "accept: latest first, then all")
+    check(hint("/invite a", ["ana"]).allSatisfy(\.run) && suggest("/block ", cx).allSatisfy(\.run) && hint("/friend ").allSatisfy(\.run)
+          && hint("/fri").allSatisfy(\.run), "Enter runs what's picked, like sending a message")
+    check(listMenu("/friend") == "/friend list " && listMenu("/Friend  add") == "/friend add " && listMenu("/browse") == "/browse "
+          && listMenu("/accept") == nil && listMenu("/room lab") == nil && listMenu("hi") == nil, "bare list commands open menus")
+    let fm = menuRows("/friend list ", ["bo"], cx)
+    check(fm.depth == 1 && fm.title?.label == "bo" && fm.rows.first?.replace == "/friend remove bo", "menu opens the picked row")
+    check(menuRows("/friend list ", ["al"], cx).depth == 0 && menuRows("/status ", ["al", "x"], cx).depth == 1, "a row that's gone backs the menu up")
+    let lk = Ctx(joined: ["public"], open: ["vault": 2], locked: ["vault"], descs: ["vault": "secrets"])
+    check(suggest("/browse ", lk).first?.detail == "2 in it · invite or password · secrets" && suggest("/browse ", lk).first?.sub?.map(\.replace) == ["/join vault ", "/request vault"],
+          "password rooms: type it, or ask")
+    check(suggest("/join v", lk).map(\.replace) == ["/join vault "] && paramGuide("/join vault ")?.focus == "[password]", "/join asks for the password")
+    check(hint("/room create lab pw").isEmpty, "/room create: nothing to pick for the password")
     check(suggest("/request ", cx).map(\.replace) == ["/request art", "/request band"], "request lists rooms not joined")
     check(suggest("#cl", cx).map(\.replace) == ["#club "] && suggest("#club", cx).isEmpty && suggest("#club hi", cx).isEmpty, "#room completes")
 
@@ -2008,6 +2622,27 @@ func selftest() {
     check(hotKeySpec([.control, .shift], key: kVK_ANSI_P, chars: "p")! == (controlKey | shiftKey, "⌃⇧P"), "shortcut label order")
     check(hotKeySpec([], key: kVK_ANSI_P, chars: "p") == nil && hotKeySpec(.command, key: kVK_ANSI_C, chars: "c") == nil,
           "plain and ⌘ keys refused")
+
+    check(initials("jordan_k") == "JK" && initials("alex") == "A" && initials("a-b-c") == "AB" && initials("__") == "_", "letters picture")
+    let photo = NSImage(size: NSSize(width: 300, height: 120), flipped: false) { r in NSColor.red.setFill(); r.fill(); return true }
+    let jpg = squareJPEG(photo)!, jpg64 = jpg.base64EncodedString()
+    check(isImageData(jpg) && NSBitmapImageRep(data: jpg)?.pixelsWide == 96 && NSBitmapImageRep(data: jpg)?.pixelsHigh == 96 && jpg64.count < 16000,
+          "chosen picture becomes a small square JPEG (\(jpg64.count) chars)")
+    check(validPic("letters") == "letters" && validPic(jpg64) == jpg64 && validPic("GIF89a") == ""
+          && validPic(Data("GIF89a....".utf8).base64EncodedString()) == "" && validPic(String(repeating: "A", count: 20000)) == "", "only small JPEG/PNG pass")
+    check(avatarImage("letters", name: "jo", color: .red) != nil && avatarImage(jpg64, name: "jo", color: .red) != nil && avatarImage("", name: "jo", color: .red) == nil,
+          "pictures draw, no picture draws nothing")
+    let pv = Server(retention: 60)
+    var pvin: [Int: [Msg]] = [:]
+    for id in 1...3 { pv.add(id, send: { pvin[id, default: []].append($0) }, close: {}) }
+    pv.handle(1, Msg(t: "hello", from: "ann", pic: "letters"))
+    pv.handle(2, Msg(t: "hello", from: "ben", pic: "not a picture"))
+    pv.handle(3, Msg(t: "hello", from: "cat", hidden: true, pic: jpg64))
+    check(pvin[2]!.contains { $0.t == "pic" && $0.from == "ann" && $0.pic == "letters" } && pvin[1]!.contains { $0.t == "pic" && $0.from == "ben" && $0.pic == "" },
+          "everyone gets pictures; a bad one is no picture")
+    check(!pvin.values.joined().contains { $0.t == "pic" && $0.from == "cat" }, "invisible people's pictures stay home")
+    pv.handle(1, Msg(t: "nick", from: "ann", pic: ""))
+    check(pvin[2]!.last(where: { $0.t == "pic" })?.pic == "", "removing a picture reaches everyone")
 
     check(validName("ana_b") && !validName("a") && !validName("bad name") && !validName(String(repeating: "a", count: 21)), "name rules")
     let now = Date()
@@ -2028,7 +2663,7 @@ func selftest() {
     q.handle(2, Msg(t: "request", room: "club"))
     check(qin[1]?.last?.t == "request" && qin[1]?.last?.from == "ann", "members hear the request")
     q.handle(2, Msg(t: "request", room: "club"))
-    check(qin[2]?.last?.text?.hasPrefix("one request a minute") == true, "one request a minute")
+    check(qin[2]?.last?.text?.hasPrefix("try again in") == true, "one request a minute")
     q.handle(3, Msg(t: "request", room: "club"))
     q.handle(1, Msg(t: "accept", room: "club"))
     check(inClub(3) && !inClub(2), "/accept lets in whoever asked last")
@@ -2055,6 +2690,85 @@ func selftest() {
     check(q.clients[2]?.nicks["club"] == nil, "leaving drops the nickname")
     q.handle(1, Msg(t: "leave", room: "club"))
     check(qin[5]?.last(where: { $0.t == "rooms" })?.counts == [:], "closed rooms leave the list")
+
+    // Room passwords
+    let pw = roomPass("hunter2")
+    check(pw != "hunter2" && pw == roomPass(" hunter2 ") && pw != roomPass("hunter3"), "password is hashed")
+    func inVault(_ id: Int) -> Bool { q.clients[id]?.rooms.contains("vault") == true }
+    q.handle(1, Msg(t: "create", room: "vault", text: pw))
+    check(qin[5]?.last(where: { $0.t == "rooms" })?.names == ["vault"], "everyone sees which rooms take a password")
+    q.handle(5, Msg(t: "join", room: "vault"))
+    check(!inVault(5) && qin[5]?.last?.text?.contains("needs a password") == true, "no password, no entry")
+    q.handle(5, Msg(t: "join", room: "vault", text: roomPass("nope")))
+    check(!inVault(5) && qin[5]?.last?.text == "wrong password for #vault", "wrong password refused")
+    q.handle(5, Msg(t: "join", room: "vault", text: pw))
+    check(!inVault(5), "one guess every 3 seconds")
+    q.tried[5]! -= 3
+    q.handle(5, Msg(t: "join", room: "vault", text: pw))
+    check(inVault(5) && q.snapshot().rooms["vault"]?.pass == pw, "right password gets in; the next host keeps it")
+    q.handle(5, Msg(t: "desc", room: "vault", text: "  secrets  "))
+    check(qin[1]?.last(where: { $0.t == "rooms" })?.descs == ["vault": "secrets"] && q.snapshot().rooms["vault"]?.desc == "secrets",
+          "a member describes the room; everyone browsing sees it")
+    q.handle(3, Msg(t: "desc", room: "vault", text: "hijack"))
+    check(q.descs["vault"] == "secrets", "only members can describe a room")
+    q.handle(4, Msg(t: "create", room: "den", descs: ["den": "  quiet corner  "]))
+    check(q.descs["den"] == "quiet corner" && q.passwords["den"] == nil, "description when making a room, no password")
+    q.lastAsk = [:]  // everyone asked to join #club under a minute ago
+    q.handle(3, Msg(t: "request", room: "vault"))
+    q.handle(5, Msg(t: "rename", room: "vault", text: "den"))
+    check(q.owners["den"] == 4 && q.clients[1]?.rooms.contains("vault") == true, "can't rename onto a taken name")
+    q.handle(3, Msg(t: "rename", room: "vault", text: "Safe"))
+    check(q.owners["safe"] == nil && q.owners["vault"] == 1, "only members rename")
+    q.handle(5, Msg(t: "rename", room: "vault", text: "Safe"))
+    check(q.owners["safe"] == 1 && q.owners["vault"] == nil && q.passwords["safe"] == pw && q.descs["safe"] == "secrets"
+          && q.clients[1]?.rooms.contains("safe") == true && q.clients[5]?.rooms.contains("vault") == false && q.requests["safe"] == [3],
+          "rename moves the room, its password, description, members and requests")
+    check([1, 3, 5].allSatisfy { id in qin[id]!.contains { $0.t == "renamed" && $0.room == "vault" && $0.text == "safe" } }
+          && qin[1]?.last(where: { $0.t == "rooms" })?.counts?["safe"] == 2, "members and people asking hear the new name")
+    q.tried[2] = nil
+    q.handle(2, Msg(t: "join", room: "safe", text: pw))
+    check(q.clients[2]?.rooms.contains("safe") == true, "the password still works after a rename")
+    q.handle(4, Msg(t: "leave", room: "den"))
+    q.handle(1, Msg(t: "leave", room: "safe"))
+    check(q.passwords["safe"] == nil && q.descs["safe"] == nil && qin[5]?.last(where: { $0.t == "rooms" })?.names == [], "closing drops the password")
+
+    // Room types: 0 invite only, 1 password only, 2 invite or password, 3 open access
+    let ty = Server(retention: 60)
+    var tin: [Int: [Msg]] = [:]
+    for (id, n) in [(1, "ana"), (2, "bo"), (3, "cy")] {
+        ty.add(id, send: { tin[id, default: []].append($0) }, close: {})
+        ty.handle(id, Msg(t: "hello", from: n))
+    }
+    func inT(_ id: Int, _ r: String) -> Bool { ty.clients[id]?.rooms.contains(r) == true }
+    ty.handle(1, Msg(t: "create", room: "Current"))
+    ty.handle(1, Msg(t: "create", room: "set"))
+    check(ty.owners.isEmpty && tin[1]?.last?.text == "#set can't be a room name", "reserved words can't name a room")
+    ty.handle(1, Msg(t: "create", room: "inv"))
+    check(ty.types["inv"] == 0, "rooms are invite only by default")
+    ty.handle(1, Msg(t: "pass", room: "inv", text: pw))
+    check(tin[1]?.last?.t == "asktype" && ty.types["inv"] == 0, "a password on an invite-only room asks which type uses it")
+    ty.handle(2, Msg(t: "join", room: "inv", text: pw))
+    check(!inT(2, "inv"), "type 0 ignores the password")
+    ty.handle(1, Msg(t: "type", room: "inv", text: "2"))
+    ty.handle(2, Msg(t: "join", room: "inv", text: pw))
+    check(inT(2, "inv") && tin[3]?.last(where: { $0.t == "rooms" })?.types?["inv"] == 2, "type 2: the password gets in; everyone sees the type")
+    ty.handle(1, Msg(t: "create", room: "pw", types: ["pw": 1]))
+    check(tin[1]?.last?.t == "askpass" && tin[3]?.last(where: { $0.t == "rooms" })?.names == ["inv", "pw"], "type 1 asks for a password")
+    ty.handle(1, Msg(t: "invite", room: "pw", text: "cy"))
+    ty.handle(3, Msg(t: "request", room: "pw"))
+    ty.handle(3, Msg(t: "join", room: "pw"))
+    check(!inT(3, "pw") && ty.invites["pw"] == nil && ty.requests["pw"] == nil, "type 1: no invites, no requests")
+    ty.handle(1, Msg(t: "pass", room: "pw", text: pw))
+    check(tin[1]?.last?.t != "asktype", "type 1 already uses the password")
+    ty.handle(1, Msg(t: "type", room: "pw", text: "3"))
+    ty.handle(3, Msg(t: "join", room: "pw"))
+    check(inT(3, "pw"), "type 3: anyone gets in")
+    ty.handle(1, Msg(t: "type", room: "pw", text: "7"))
+    check(ty.types["pw"] == 3, "only types 0–3")
+    ty.handle(3, Msg(t: "rename", room: "pw", text: "current"))
+    check(ty.owners["pw"] != nil, "can't rename to a reserved word")
+    ty.handle(3, Msg(t: "rename", room: "pw", text: "hall"))
+    check(ty.types["hall"] == 3 && ty.snapshot().rooms["hall"]?.type == 3, "rename keeps the type; the next host gets it")
 
     // End-to-end encryption
     let A = Identity(), B = Identity(), C = Identity()
@@ -2135,7 +2849,7 @@ func selftest() {
     h.handle(3, Msg(t: "hello", from: "ollie", key: K[2], since: 70))
     h.handle(4, Msg(t: "hello", from: "pia", key: K[3], since: 90))
     check(h.successors == [2, 3], "the two oldest other hosts are next in line, never the host itself")
-    h.handle(3, Msg(t: "create", room: "lab"))
+    h.handle(3, Msg(t: "create", room: "lab", text: "PW"))
     h.handle(3, Msg(t: "invite", room: "lab", text: "nell"))
     h.handle(2, Msg(t: "join", room: "lab"))
     h.handle(2, Msg(t: "alias", room: "lab", text: "Nn"))
@@ -2144,7 +2858,7 @@ func selftest() {
     h.handle(1, Msg(t: "say", text: "before"))
     h.handle(3, Msg(t: "say", room: "lab", ct: "LAB", wraps: [:]))
     let lab = next.restore["lab"]
-    check(lab?.members == ["nell": K[1], "ollie": K[2]] && lab?.owner == "ollie" && lab?.invites == ["pia"] && lab?.nicks == ["nell": "Nn"],
+    check(lab?.members == ["nell": K[1], "ollie": K[2]] && lab?.owner == "ollie" && lab?.invites == ["pia"] && lab?.nicks == ["nell": "Nn"] && lab?.pass == "PW",
           "next in line has the rooms: \(String(describing: lab))")
     check(next.history.contains { $0.text == "before" } && next.history.contains { $0.ct == "LAB" }, "next in line has the messages")
     let seen = next.history.first { $0.text == "before" }?.ts
@@ -2153,6 +2867,7 @@ func selftest() {
     next.handle(1, Msg(t: "hello", from: "nell", ts: seen, key: K[1], since: next.since))  // the old host is gone
     check(next.clients[1]?.rooms.contains("lab") == true && next.clients[1]?.nicks["lab"] == "Nn"
           && nin[1]!.contains { $0.t == "joined" && $0.text == "restored" }, "back in the room after the host changed")
+    check(next.passwords["lab"] == "PW" && next.types["lab"] == 2, "room password and type carry over")
     check(!nin[1]!.contains { $0.text == "before" }, "no repeats of messages already seen")
     next.handle(2, Msg(t: "hello", from: "ollie", key: publicKey(Identity())))
     check(next.clients[2]?.rooms.contains("lab") == false && next.owners["lab"] == -1, "same name from another Mac doesn't get in")
@@ -2239,6 +2954,8 @@ func selftest() {
     let tcpOpts = tcp().defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options
     check(tcpOpts?.enableKeepalive == true && tcp().includePeerToPeer, "keepalive notices dead links; peer-to-peer stays on")
     check(NWTXTRecord(["id": "x", "since": "12.5"])["since"].flatMap(Double.init) == 12.5, "host start time survives the TXT record")
+    check(tagVersion(URL(string: "https://github.com/sbrothers7/psst/releases/tag/v1.4.0")) == "1.4.0"
+          && tagVersion(URL(string: "https://github.com/sbrothers7/psst/releases")) == nil && tagVersion(nil) == nil, "version from the latest release's tag")
     check(isNewer("1.10", than: "1.9") && isNewer("1.3.1", than: "1.3") && isNewer("1.4", than: "1.3.1") && isNewer("1.0\n", than: "0") && !isNewer("1.2", than: "1.2") && !isNewer("1.1", than: "1.2"),
           "version compare")
     print("selftest ok")

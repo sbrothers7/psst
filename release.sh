@@ -14,7 +14,7 @@ Psst.app/Contents/MacOS/Psst --selftest
 OUT=$(mktemp -d)
 ditto -c -k --keepParent Psst.app "$OUT/Psst.zip"
 Psst.app/Contents/MacOS/Psst --sign "$OUT/Psst.zip" "$KEY" > "$OUT/Psst.zip.sig"
-echo "$V" > "$OUT/version.txt"
+echo "$V" > "$OUT/version.txt"  # only Psst 1.3.1 and older read this; newer copies take the version from the release tag
 
 git push
 gh release create "v$V" "$OUT/Psst.zip" "$OUT/Psst.zip.sig" "$OUT/version.txt" --title "Psst $V" --generate-notes
