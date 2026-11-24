@@ -13,12 +13,12 @@ Psst checks for updates every few hours and installs them by itself.
 
 ## Use
 
-- **⌥ + Space** opens the chat bar. **Enter** sends, **Esc** closes, **⌘Q** or `/quit` quits.
+- **⌥ + Space** opens the chat bar (change it in Settings). **Enter** sends, **Esc** closes, **⌘Q** or `/quit` quits.
 - One person types `/host`. Everyone else connects automatically, over the network. If the network blocked or unavailable, Psst will connect directly over Wi-Fi (like AirDrop).
 - Type `/` to see every command, or `:name` for emoji (`:fire:` 🔥). Messages support `**bold**`, `*italic*`, `` `code` `` and `~~strike~~`.
 - `/room`, `/invite`, `/join` and `/leave` handle private rooms. A room closes when the room host user leaves or quits.
 - Drag the bubbles to move them. Right-click a bubble to lock it in place.
-- `/settings` holds your name, visibility, who can invite you, and fade time. `/setup` shows the welcome again.
+- `/settings` holds your name, name color, chat shortcut, visibility, who can invite you, and fade time.
 
 ## Privacy
 

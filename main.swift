@@ -49,6 +49,7 @@ struct Msg: Codable {
     var keys: [String: String]? = nil // who/members: name -> public key
     var ct: String? = nil             // private-room say: the encrypted message
     var wraps: [String: String]? = nil // private-room say: name -> message key locked for that member
+    var color: String? = nil          // say: the sender's name color, one of nameColors
 }
 
 // MARK: - End-to-end encryption (private rooms)
@@ -145,6 +146,41 @@ func nameChangeLeft(since: Date?, now: Date = Date()) -> TimeInterval {
     return max(0, since.addingTimeInterval(nameCooldown).timeIntervalSince(now))
 }
 
+/// /status text: friends first (★), `per` names a page. `page` is 1-based and clamped.
+func statusPage(_ names: [String], friends: [String], page: Int, per: Int = 10) -> String {
+    let all = names.filter(friends.contains) + names.filter { !friends.contains($0) }
+    guard !all.isEmpty else { return "no one online" }
+    let pages = (all.count + per - 1) / per, p = min(max(page, 1), pages)
+    let shown = all[(p - 1) * per..<min(p * per, all.count)].map { (friends.contains($0) ? "★ " : "") + $0 }
+    return "online \(all.count)" + (pages > 1 ? ", page \(p)/\(pages)" : "") + ": " + shown.joined(separator: ", ")
+        + (p < pages ? ". /status \(p + 1) for more" : "")
+}
+
+// MARK: - Name colors
+
+let nameColors: [(name: String, color: NSColor)] = [
+    ("red", .systemRed), ("orange", .systemOrange), ("yellow", .systemYellow), ("green", .systemGreen), ("mint", .systemMint),
+    ("teal", .systemTeal), ("blue", .systemBlue), ("indigo", .systemIndigo), ("purple", .systemPurple), ("pink", .systemPink),
+]
+
+/// The color someone picked, else one picked from their name (the same on every Mac).
+func nameColor(_ name: String, _ pick: String?) -> NSColor {
+    if let c = nameColors.first(where: { $0.name == pick }) { return c.color }
+    let h = name.unicodeScalars.reduce(UInt32(0)) { $0 &* 31 &+ $1.value }
+    return nameColors[Int(h % UInt32(nameColors.count))].color
+}
+
+// MARK: - Chat shortcut
+
+/// Carbon modifier mask and label ("⌃⌥Space") for a key press. nil without ⌃ or ⌥: plain or ⌘ keys are other apps' shortcuts.
+func hotKeySpec(_ f: NSEvent.ModifierFlags, key: Int, chars: String) -> (mods: Int, label: String)? {
+    guard f.contains(.control) || f.contains(.option) else { return nil }
+    let on = [(NSEvent.ModifierFlags.control, controlKey, "⌃"), (.option, optionKey, "⌥"), (.shift, shiftKey, "⇧"), (.command, cmdKey, "⌘")]
+        .filter { f.contains($0.0) }
+    let names = [kVK_Space: "Space", kVK_Return: "↩", kVK_Tab: "⇥", kVK_Delete: "⌫"]  // ponytail: F-keys show as a blank glyph
+    return (on.reduce(0) { $0 | $1.1 }, on.map(\.2).joined() + (names[key] ?? chars.uppercased()))
+}
+
 // MARK: - :shortcode: → emoji
 
 let emojiAliases: [String: String] = [
@@ -192,13 +228,12 @@ let commands: [(name: String, arg: String, help: String)] = [
     ("/invite", "name", "invite someone to this room"),
     ("/join", "room", "join a room you were invited to, or public"),
     ("/leave", "", "leave this room"),
-    ("/who", "", "show online status"),
+    ("/status", "page", "who's online, friends first, 10 per page"),
     ("/friend", "list|add|remove name", "show friend list"),
     ("/block", "name", "block or unblock someone; /block lists blocked"),
     ("/nick", "name", "change your name (once every 2 weeks)"),
     ("/history", "", "replay this room's recent messages"),
     ("/settings", "", "show settings pane"),
-    ("/setup", "", "show the welcome and setup again"),
     ("/host", "", "start/stop hosting on this machine"),
     ("/key", "name", "show a key code to compare in person; alone shows yours"),
     ("/trust", "name", "accept someone's new key after comparing codes"),
@@ -264,9 +299,9 @@ func suggest(_ text: String, roster: [String], rooms: [String], friends: [String
 
 // MARK: - Text styling
 
-func styled(_ s: String, dim: Bool = false, bold: Bool = false) -> NSAttributedString {
+func styled(_ s: String, dim: Bool = false, bold: Bool = false, color: NSColor? = nil) -> NSAttributedString {
     NSAttributedString(string: s, attributes: [.font: NSFont.systemFont(ofSize: 12, weight: bold ? .semibold : .regular),
-                                               .foregroundColor: dim ? NSColor.secondaryLabelColor : NSColor.labelColor])
+                                               .foregroundColor: color ?? (dim ? NSColor.secondaryLabelColor : NSColor.labelColor)])
 }
 
 /// Inline markdown: **bold**, *italic*, `code`, ~~strike~~, [link](url).
@@ -442,6 +477,7 @@ final class Server {
         case "say":
             guard c.rooms.contains(room) else { return }
             var out = Msg(t: "say", room: room, from: c.name, ts: Date().timeIntervalSince1970)
+            out.color = nameColors.contains { $0.name == m.color } ? m.color : nil
             if room == "public" {
                 let text = String((m.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines).prefix(maxText))
                 guard !text.isEmpty else { return }
@@ -616,9 +652,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     let nameField = NSTextField(), nameNote = NSTextField(wrappingLabelWithString: "")
     let lockBox = NSButton(checkboxWithTitle: "Lock overlay position", target: nil, action: nil)
     let saveButton = NSButton(title: "Save", target: nil, action: nil)
+    let shortcutButton = NSButton(title: "", target: nil, action: nil)
+    var recorder: Any?  // key monitor while a new shortcut is being typed
     var popups: [NSPopUpButton] = []
 
     var name: String? { d.string(forKey: "name") }  // nil until picked on first launch
+    var shortcut: String { d.string(forKey: "hotKeyLabel") ?? "⌥Space" }
     var friends: [String] {
         get { d.stringArray(forKey: "friends") ?? [] }
         set { d.set(newValue, forKey: "friends") }
@@ -639,6 +678,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     func applicationDidFinishLaunching(_ n: Notification) {
         let f = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 800, height: 600)
         d.register(defaults: ["cooldown": 10.0, "retention": 600.0, "invisible": false, "invites": "everyone",
+                              "color": "auto", "hotKeyCode": kVK_Space, "hotKeyMods": optionKey, "hotKeyLabel": "⌥Space",
                               "x": f.minX + 12, "y": f.minY + 12])
         buildUI()
         registerHotKey()
@@ -719,9 +759,17 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
             DispatchQueue.main.async { (NSApp.delegate as? App)?.toggleInput() }
             return noErr
         }, 1, &spec, nil, nil)
-        let err = RegisterEventHotKey(UInt32(kVK_Space), UInt32(optionKey), EventHotKeyID(signature: 0x50535354, id: 1),
-                                      GetApplicationEventTarget(), 0, &hotKey)
-        if err != noErr { show("⌥Space is taken by another app; use the menu bar icon", dim: true) }
+        if !bindHotKey(d.integer(forKey: "hotKeyCode"), d.integer(forKey: "hotKeyMods")) {
+            show("\(shortcut) is taken by another app; pick another in Settings", dim: true)
+        }
+    }
+
+    /// Swaps the global shortcut. false if another app already holds that key.
+    func bindHotKey(_ code: Int, _ mods: Int) -> Bool {
+        if let hotKey { UnregisterEventHotKey(hotKey) }
+        hotKey = nil
+        return RegisterEventHotKey(UInt32(code), UInt32(mods), EventHotKeyID(signature: 0x50535354, id: 1),
+                                   GetApplicationEventTarget(), 0, &hotKey) == noErr
     }
 
     // MARK: Position (drag any bubble; everything moves together)
@@ -891,7 +939,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
             return note(server == nil ? "stopped hosting" : "hosting on this Mac as \(name ?? ""); others on the network will find it")
         case "/quit": return NSApp.terminate(nil)
         case "/settings": return showSettings(welcome: false)
-        case "/setup": return showSettings(welcome: true)
         case "/nick": return note(setName(arg))
         case "/friend": return note(friend(arg))
         case "/block":
@@ -919,14 +966,15 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         case "/invite": line.send(Msg(t: "invite", room: room, text: arg))
         case "/leave": line.send(Msg(t: "leave", room: room))
         case "/history": line.send(Msg(t: "history", room: room))
-        case "/who": show("online: " + roster.joined(separator: ", "), dim: true)
+        case "/status": show(statusPage(roster, friends: friends, page: Int(arg) ?? 1), dim: true)
         case _ where s.hasPrefix("/"): show(commands.map(usage).joined(separator: " · "), dim: true)
         default:
-            guard room != "public" else { return line.send(Msg(t: "say", room: room, text: emojify(s))) }
+            let color = d.string(forKey: "color")
+            guard room != "public" else { return line.send(Msg(t: "say", room: room, text: emojify(s), color: color)) }
             let to = (members[room] ?? [:]).filter { pins[$0.key] == $0.value }  // only people whose key we trust
             guard let sealed = seal(emojify(s), room: room, from: me, to: to, with: identity)
             else { return note("couldn't encrypt that message") }
-            line.send(Msg(t: "say", room: room, ct: sealed.ct, wraps: sealed.wraps))
+            line.send(Msg(t: "say", room: room, ct: sealed.ct, wraps: sealed.wraps, color: color))
         }
     }
 
@@ -959,7 +1007,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
                 text = opened
             }
             let s = NSMutableAttributedString(attributedString: styled(tag, dim: true))
-            s.append(styled("\(from): ", bold: true))
+            s.append(styled("\(from): ", bold: true, color: nameColor(from, m.color)))
             s.append(markdown(text))
             show(s)
         default: break
@@ -1055,7 +1103,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
             return
         }
         add(me.isEmpty ? "Looking for a host…" : "\(me) in #\(room) via \(via)")
-        add("Write…   ⌥Space", #selector(toggleInput))
+        add("Write…   \(shortcut)", #selector(toggleInput))
         menu.addItem(.separator())
 
         add(room == "public" ? "Online (/room to invite)" : "Online: click to invite to #\(room)")
@@ -1109,11 +1157,17 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
 
     @objc func openSettings() { showSettings(welcome: false) }
 
-    /// welcome = onboarding: first launch and /setup show the how-to on top of the settings.
+    /// welcome = onboarding: the first launch shows the how-to on top of the settings.
     func showSettings(welcome: Bool) {
         if settings == nil { settings = buildSettings() }
         let w = settings!
         welcomeText.isHidden = !welcome
+        welcomeText.stringValue = """
+            Chat with people on this network. Messages fade away and nothing is saved.
+            \(shortcut) opens the chat bar. Type / for commands, :name for emoji, **bold** for markdown.
+            One person types /host and everyone else connects on their own.
+            Drag the bubbles to move them; right-click to lock them in place.
+            """
         box.setFrameSize(box.fittingSize)
         w.setContentSize(NSSize(width: box.frame.width + 40, height: box.frame.height + 40))
         w.title = welcome ? "Welcome to Psst" : "Psst Settings"
@@ -1138,16 +1192,23 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         nameNote.preferredMaxLayoutWidth = 260
         lockBox.target = self
         lockBox.action = #selector(lockChanged)
+        shortcutButton.target = self
+        shortcutButton.action = #selector(recordShortcut)
+        shortcutButton.title = shortcut
         popups = [
             popup("invisible", [("Show me in the online list", false), ("Invisible: hide me from the online list", true)]),
             popup("invites", [("Everyone", "everyone"), ("Friends only", "friends"), ("Nobody", "nobody")]),
             popup("cooldown", [("5 seconds", 5.0), ("10 seconds", 10.0), ("30 seconds", 30.0), ("1 minute", 60.0)]),
             popup("retention", [("1 minute", 60.0), ("10 minutes", 600.0), ("1 hour", 3600.0), ("1 day", 86400.0)]),
+            popup("color", [("Auto", "auto")] + nameColors.map { ($0.name.capitalized, $0.name) }),
         ]
+        for (item, c) in zip(popups[4].itemArray.dropFirst(), nameColors) { item.image = swatch(c.color) }
         func label(_ s: String) -> NSTextField { NSTextField(labelWithString: s) }
         let grid = NSGridView(views: [
             [label("Username"), NSStackView(views: [nameField, saveButton])],
             [NSGridCell.emptyContentView, nameNote],
+            [label("Name color"), popups[4]],
+            [label("Chat shortcut"), shortcutButton],
             [label("Visibility"), popups[0]],
             [label("Room invites from"), popups[1]],
             [label("Messages fade after"), popups[2]],
@@ -1157,12 +1218,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         grid.column(at: 0).xPlacement = .trailing
         grid.rowAlignment = .firstBaseline
         grid.rowSpacing = 10
-        welcomeText.stringValue = """
-            Chat with people on this network. Messages fade away and nothing is saved.
-            ⌥Space opens the chat bar. Type / for commands, :name for emoji, **bold** for markdown.
-            One person types /host and everyone else connects on their own.
-            Drag the bubbles to move them; right-click to lock them in place.
-            """
         welcomeText.preferredMaxLayoutWidth = grid.fittingSize.width  // wrap to the settings' width
         box.orientation = .vertical
         box.alignment = .leading
@@ -1200,6 +1255,47 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
             p.selectItem(at: p.itemArray.firstIndex { ($0.representedObject as? NSObject)?.isEqual(current) == true } ?? 0)
         }
         lockBox.state = d.bool(forKey: "locked") ? .on : .off
+        popups[4].itemArray.first?.image = swatch(nameColor(name ?? "", nil))  // what Auto gives this name
+        shortcutButton.title = shortcut
+    }
+
+    func swatch(_ c: NSColor) -> NSImage {
+        NSImage(size: NSSize(width: 10, height: 10), flipped: false) { r in c.setFill(); NSBezierPath(ovalIn: r).fill(); return true }
+    }
+
+    /// Click, then press the new keys. Esc cancels. The old shortcut is off meanwhile so it can be typed again.
+    @objc func recordShortcut() {
+        guard recorder == nil else { return }
+        if let hotKey { UnregisterEventHotKey(hotKey) }
+        hotKey = nil
+        shortcutButton.title = "Press keys… (Esc cancels)"
+        recorder = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
+            guard let self else { return e }
+            let code = Int(e.keyCode)
+            if code != kVK_Escape {
+                guard let spec = hotKeySpec(e.modifierFlags, key: code, chars: e.charactersIgnoringModifiers ?? "") else {
+                    self.shortcutButton.title = "Use ⌃ or ⌥ with a key"
+                    return nil
+                }
+                if self.bindHotKey(code, spec.mods) {
+                    self.d.set(code, forKey: "hotKeyCode")
+                    self.d.set(spec.mods, forKey: "hotKeyMods")
+                    self.d.set(spec.label, forKey: "hotKeyLabel")
+                } else {
+                    self.nameNote.stringValue = "\(spec.label) is taken by another app."
+                }
+            }
+            self.stopRecording()
+            return nil
+        }
+    }
+
+    func stopRecording() {
+        guard let r = recorder else { return }
+        NSEvent.removeMonitor(r)
+        recorder = nil
+        if hotKey == nil { _ = bindHotKey(d.integer(forKey: "hotKeyCode"), d.integer(forKey: "hotKeyMods")) }  // cancelled or taken: keep the old one
+        shortcutButton.title = shortcut
     }
 
     func waitText(_ s: TimeInterval) -> String {
@@ -1225,7 +1321,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     }
 
     func windowWillClose(_ n: Notification) {
-        if (n.object as? NSWindow) === settings { NSApp.deactivate() }  // hand focus back to whatever was in front
+        guard (n.object as? NSWindow) === settings else { return }
+        stopRecording()
+        NSApp.deactivate()  // hand focus back to whatever was in front
     }
 
     /// Sets the username if the 2-week rule allows. Returns what happened, for the user.
@@ -1238,7 +1336,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         d.set(n, forKey: "name")
         d.set(Date(), forKey: "nameSetAt")
         if let line { line.send(Msg(t: "nick", from: n, hidden: d.bool(forKey: "invisible"), key: publicKey(identity))) } else { connect() }
-        return "Saved: you're \(n). ⌥Space to chat. Next name change in 2 weeks."
+        return "Saved: you're \(n). \(shortcut) to chat. Next name change in 2 weeks."
     }
 
     /// /friend list|add|remove name. Friends are kept on this Mac only.
@@ -1291,6 +1389,10 @@ func selftest() {
     check(last(2)?.text == "hi" && last(3)?.from == "ana", "public reaches everyone")
     s.handle(3, Msg(t: "say", room: "public", from: "ana", text: "spoof"))
     check(last(1)?.from == "bob", "sender name comes from host, not client")
+    s.handle(1, Msg(t: "say", room: "public", text: "c1", color: "teal"))
+    s.handle(1, Msg(t: "say", room: "public", text: "c2", color: "#ff0000; evil"))
+    check(last(2)?.text == "c2" && last(2)?.color == nil && inbox[2]!.contains { $0.text == "c1" && $0.color == "teal" },
+          "host passes only palette colors")
 
     s.add(4, send: { inbox[4, default: []].append($0) }, close: {})
     s.handle(4, Msg(t: "hello", from: "ghost", hidden: true))
@@ -1330,7 +1432,7 @@ func selftest() {
     check(paramGuide("/friend a")?.focus == "‹list|add|remove›", "guide highlights first parameter")
     check(paramGuide("/friend add b")?.focus == "‹name›", "guide moves to second parameter")
     check(paramGuide("/friend ")?.label == "/friend ‹list|add|remove› ‹name›", "one bracket per parameter")
-    check(paramGuide("/who ") == nil && paramGuide("/fri") == nil && paramGuide("hi") == nil, "no guide without parameters")
+    check(paramGuide("/leave ") == nil && paramGuide("/fri") == nil && paramGuide("hi") == nil, "no guide without parameters")
     check(hint("hi :fir").first?.replace == "hi 🔥", "emoji suggestions: \(hint("hi :fir").map(\.label))")
     check(hint("at 10:30").isEmpty && hint("a :x").isEmpty, "no emoji guide for times or 1 letter")
     check(hint("/friend ").map(\.replace) == ["/friend list", "/friend add ", "/friend remove "], "/friend shows subcommands")
@@ -1339,6 +1441,19 @@ func selftest() {
     check(suggest("/friend remove ", roster: [], rooms: [], friends: ["bo"]).map(\.replace) == ["/friend remove bo"],
           "/friend remove suggests friends")
     check(suggest("/block z", roster: ["ana"], rooms: [], blocked: ["zed"]).map(\.replace) == ["/block zed"], "/block suggests blocked to unblock")
+
+    let crowd = (1...25).map { "p\($0)" }
+    let p1 = statusPage(crowd, friends: ["p20"], page: 1)
+    check(p1.hasPrefix("online 25, page 1/3: ★ p20, p1,") && p1.hasSuffix("p9. /status 2 for more"), "status page 1: \(p1)")
+    check(statusPage(crowd, friends: [], page: 9).hasSuffix("page 3/3: p21, p22, p23, p24, p25"), "status clamps to last page")
+    check(statusPage(["ana"], friends: [], page: 1) == "online 1: ana" && statusPage([], friends: [], page: 1) == "no one online",
+          "status without pages")
+    check(nameColor("ana", "red") == .systemRed && nameColor("ana", nil) == nameColor("ana", "bogus"), "picked color, else from name")
+    check(Set(["ana", "bob", "cy", "dee", "eli"].map { nameColor($0, nil) }).count > 1, "names spread over colors")
+    check(hotKeySpec(.option, key: kVK_Space, chars: " ")! == (optionKey, "⌥Space"), "default shortcut")
+    check(hotKeySpec([.control, .shift], key: kVK_ANSI_P, chars: "p")! == (controlKey | shiftKey, "⌃⇧P"), "shortcut label order")
+    check(hotKeySpec([], key: kVK_ANSI_P, chars: "p") == nil && hotKeySpec(.command, key: kVK_ANSI_C, chars: "c") == nil,
+          "plain and ⌘ keys refused")
 
     check(validName("ana_b") && !validName("a") && !validName("bad name") && !validName(String(repeating: "a", count: 21)), "name rules")
     let now = Date()
