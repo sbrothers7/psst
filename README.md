@@ -1,6 +1,6 @@
 # Psst
 
-A tiny chat overlay for Macs on the same network. Messages appear in a corner of the screen and fade away. Nothing is saved.
+A tiny LAN chat overlay for Macs.
 
 ## Install
 
@@ -16,16 +16,20 @@ Psst checks for updates every few hours and installs them by itself.
 - **⌥ + Space** opens the chat bar (change it in Settings). **Enter** sends, **Esc** closes, **⌘Q** or `/quit` quits.
 - One person types `/host`. Everyone else connects automatically, over the network. If the network blocked or unavailable, Psst will connect directly over Wi-Fi (like AirDrop).
 - Type `/` to see every command, or `:name` for emoji (`:fire:` 🔥). Messages support `**bold**`, `*italic*`, `` `code` `` and `~~strike~~`.
-- `/room`, `/invite`, `/join` and `/leave` handle private rooms. A room closes when the room host user leaves or quits.
+- `/room <name>` makes a private room; `/room` alone lists who is in it. `/invite`, `/join` and `/leave` do the rest. A room closes when the room host user leaves or quits.
+- `/rooms` lists every room on the network. Pick one to ask to join, or `/request <room name>`. Members see the request and let people in with `/accept` (latest), `/accept <username>` or `/accept all`. One request a minute.
+- You can be in several rooms at once. Use `/join <room name>` to switch. starting a message with `#<room name>` sends it in the room specified.
+- `/nick <nickname>` sets your name in the current private room only. Public chat always shows usernames.
+- `/status` and `/friend list` show online status. Use ↑↓ and Enter to pick someone to manage.
 - Drag the bubbles to move them. Right-click a bubble to lock it in place.
-- `/settings` holds your name, name color, chat shortcut, visibility, who can invite you, and fade time.
+- `/settings` opens settings.
 
 ## Privacy
 
 - **Private rooms are end-to-end encrypted.**
 - **Public chat is not encrypted.** Anyone in it, or watching the network, can read it.
-- **Keys:** Psst remembers each person's key the first time it sees them. If someone's key changes (a new Mac, or someone in the middle), you get a warning and they can't read your private-room messages until you check. Run `/key name` on both Macs, compare the codes in person, then `/trust name`.
-- **What the host still sees:** who is online, who is in which room, and when people send messages.
+- **Keys:** Psst remembers each person's key the first time it sees them. If someone's key changes (a new Mac, or someone in the middle), you get a warning and they can't read your private-room messages until you check. Run `/key <username>` on both Macs, compare the codes in person, then `/trust <username>`.
+- The **host** can still see who is online, who is in which room, and when people send messages.
 
 ## Build
 
@@ -35,4 +39,4 @@ Psst checks for updates every few hours and installs them by itself.
 ./release.sh 1.1                             # signed GitHub release; every copy updates itself
 ```
 
-Releases are signed with an Ed25519 key kept at `~/.config/psst/update.key` on the release Mac. Installed copies refuse any update without a valid signature. If that key is lost, no further updates can be shipped, so back it up.
+Releases are signed with an Ed25519 key kept at `~/.config/psst/update.key` on the release Mac. Installed copies refuse any update without a valid signature. If that key is lost, no further updates can be shipped; backing it up is recommended.
