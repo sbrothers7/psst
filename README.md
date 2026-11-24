@@ -5,22 +5,27 @@ A tiny chat overlay for Macs on the same network. Messages appear in a corner of
 ## Install
 
 1. Download `Psst.zip` from [Releases](../../releases/latest) and unzip it.
-2. Move `Psst.app` into a folder inside your home folder, such as `~/Applications`. School accounts often can't write to the main Applications folder, and then Psst can't update itself.
-3. The first time, right-click `Psst.app` and choose **Open**, because it isn't from the App Store. Allow local network access when macOS asks.
-4. Pick the username classmates will see. You can change it once every 2 weeks.
+2. Move `Psst.app` into a folder inside your home folder, such as `~/Applications`.
+3. The first time, right-click `Psst.app` and choose **Open**. Apple will block Psst as it is not from the App Store. Allow local network access when macOS asks.
+4. Pick a username (can be change biweekly).
 
 Psst checks for updates every few hours and installs them by itself.
 
 ## Use
 
-- **⌥Space** opens the chat bar. **Enter** sends, **Esc** closes, **⌘Q** or `/quit` quits.
-- One person types `/host`. Everyone else on the network connects automatically.
+- **⌥ + Space** opens the chat bar. **Enter** sends, **Esc** closes, **⌘Q** or `/quit` quits.
+- One person types `/host`. Everyone else connects automatically, over the network. If the network blocked or unavailable, Psst will connect directly over Wi-Fi (like AirDrop).
 - Type `/` to see every command, or `:name` for emoji (`:fire:` 🔥). Messages support `**bold**`, `*italic*`, `` `code` `` and `~~strike~~`.
-- `/room`, `/invite`, `/join` and `/leave` handle private rooms. `/friend list|add|remove` and `/block` manage people.
+- `/room`, `/invite`, `/join` and `/leave` handle private rooms. A room closes when the room host user leaves or quits.
 - Drag the bubbles to move them. Right-click a bubble to lock it in place.
 - `/settings` holds your name, visibility, who can invite you, and fade time. `/setup` shows the welcome again.
 
-Messages travel unencrypted on the local network, so don't send anything private.
+## Privacy
+
+- **Private rooms are end-to-end encrypted.**
+- **Public chat is not encrypted.** Anyone in it, or watching the network, can read it.
+- **Keys:** Psst remembers each person's key the first time it sees them. If someone's key changes (a new Mac, or someone in the middle), you get a warning and they can't read your private-room messages until you check. Run `/key name` on both Macs, compare the codes in person, then `/trust name`.
+- **What the host still sees:** who is online, who is in which room, and when people send messages.
 
 ## Build
 
