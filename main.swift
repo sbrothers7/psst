@@ -6,6 +6,7 @@ import AppKit
 import Network
 import Carbon.HIToolbox
 import CryptoKit
+import ServiceManagement
 
 let serviceType = "_psst._tcp"
 let port: NWEndpoint.Port = 47820
@@ -13,10 +14,62 @@ let maxLine = 65536, maxText = 500, maxHistory = 500
 
 /// TCP that also runs over peer-to-peer Wi-Fi (AWDL, what AirDrop uses): Macs within ~30 m reach each other
 /// directly, even on networks that block devices from talking or have no shared network at all. Wi-Fi must be on.
+/// Keepalive: a host whose lid closed, or someone who walked out of range, is noticed in ~25 s instead of never,
+/// so clients reconnect (to another host if needed) and the host drops people who are gone.
 func tcp() -> NWParameters {
-    let p = NWParameters.tcp
+    let t = NWProtocolTCP.Options()
+    t.enableKeepalive = true
+    t.keepaliveIdle = 10
+    t.keepaliveInterval = 5
+    t.keepaliveCount = 3
+    t.connectionDropTime = 20  // unacknowledged sends give up after 20 s too
+    let p = NWParameters(tls: nil, tcp: t)
     p.includePeerToPeer = true
     return p
+}
+
+// MARK: - Hosting: every Mac hosts, everyone shares the oldest
+//
+// Every Mac runs a host and advertises it. All Macs join the same one, the longest-running host still reachable,
+// so no one has to type /host and a restarted Mac never splits the class. The host keeps the next two in line
+// supplied with a copy of its rooms and recent messages; if it disappears they're elected next and carry on.
+// Macs out of Wi-Fi range of the host reach it through a Mac in between (up to 3 hops).
+
+/// A Mac as seen over Bonjour. `since` = when its host started. `up` = the host it is connected to right now
+/// (maybe one this Mac can't see) and `hops` how many Macs away that is: 0 = itself, 1 = direct.
+struct HostAd: Equatable { var id: String, since: Double, up = "", upSince = Double.infinity, hops = 0 }
+
+let maxHops = 3
+
+/// The host everyone should share: the oldest one still reachable, directly or through another Mac.
+/// `down`: Macs that just failed to answer. A Mac that vanished (lid closed) stays listed for up to an hour,
+/// so it's skipped, along with the host it claimed to reach.
+func electHost(own: HostAd?, ads: [HostAd], down: Set<String>) -> HostAd? {
+    let live = ads.filter { !down.contains($0.id) }
+    var hosts = live + live.filter { !$0.up.isEmpty && $0.hops < maxHops }.map { HostAd(id: $0.up, since: $0.upSince) }
+    if let own { hosts.append(own) }
+    if hosts.isEmpty { hosts = ads }  // everyone failed: keep trying them
+    return hosts.min { ($0.since, $0.id) < ($1.since, $1.id) }
+}
+
+enum Route: Equatable { case local, direct(HostAd), relay(HostAd) }
+
+/// How to reach `host`: it's this Mac, it's in Wi-Fi range, or through the nearest Mac connected to it.
+func route(to host: String, own: String?, ads: [HostAd], down: Set<String>) -> Route? {
+    if host == own { return .local }
+    if let a = ads.first(where: { $0.id == host }), !down.contains(host) { return .direct(a) }
+    let relays = ads.filter { $0.up == host && $0.id != own && $0.hops < maxHops && !down.contains($0.id) }
+    if let r = relays.min(by: { ($0.hops, $0.id) < ($1.hops, $1.id) }) { return .relay(r) }
+    return ads.first { $0.id == host }.map { .direct($0) }  // nothing better: keep trying it
+}
+
+/// What the next host needs to carry on: rooms, who is in them (with keys, so only the same Mac gets back in),
+/// invites, requests and nicknames. By name, because everyone reconnects with new connections.
+struct Snapshot: Codable, Equatable {
+    struct Room: Codable, Equatable {
+        var owner = "", members: [String: String] = [:], invites: [String] = [], requests: [String] = [], nicks: [String: String] = [:]
+    }
+    var rooms: [String: Room] = [:]
 }
 
 // MARK: - Updates: signed GitHub releases
@@ -53,6 +106,9 @@ struct Msg: Codable {
     var nick: String? = nil           // say: the sender's nickname in that room
     var nicks: [String: String]? = nil // members: name -> nickname in that room
     var counts: [String: Int]? = nil  // rooms: every open room -> how many are in it
+    var since: Double? = nil          // hello: when my own host started, so the host knows who is next in line
+    var snap: Snapshot? = nil         // rep: rooms, for the next host in line
+    var batch: [Msg]? = nil           // rep: messages, for the next host in line
 }
 
 // MARK: - End-to-end encryption (private rooms)
@@ -230,7 +286,6 @@ let commands: [(name: String, args: [String], help: String)] = [
     ("/block", ["username"], "block or unblock someone; /block lists blocked"),
     ("/history", [], "replay this room's recent messages"),
     ("/settings", [], "show settings pane"),
-    ("/host", [], "start/stop hosting on this machine"),
     ("/key", ["username"], "show a key code to compare in person; alone shows yours"),
     ("/trust", ["username"], "accept someone's new key after comparing codes"),
     ("/quit", [], "quit Psst (or ⌘Q)"),
@@ -432,8 +487,10 @@ final class Line {
 final class Server {
     struct Client {
         var name = "anon"
+        var ready = false  // said hello
         var hidden = false
         var key = ""  // public key, passed on so members can encrypt to each other
+        var since: Double?  // when this Mac's own host started; the oldest are next in line
         var rooms: Set<String> = ["public"]
         var nicks: [String: String] = [:]  // room -> nickname there
         let send: (Msg) -> Void
@@ -441,41 +498,59 @@ final class Server {
     }
     var clients: [Int: Client] = [:]
     var invites: [String: Set<Int>] = [:]  // room -> invited client ids
-    var owners: [String: Int] = [:]        // room -> creator; the room closes when they leave or quit
+    var owners: [String: Int] = [:]        // room -> creator (-1: not back yet after a takeover); closes when they leave
     var requests: [String: [Int]] = [:]    // room -> client ids asking to join, latest last
     var lastAsk: [String: Double] = [:]    // name -> when they last asked; one request a minute
     var history: [Msg] = []
     var retention: Double
-    private var listener: NWListener?, timer: Timer?, nextID = 0
+    var successors: [Int] = [], lastSnap: Snapshot?  // next in line, and what they were last sent
+    var restore: [String: Snapshot.Room] = [:], lastRep = 0.0, tookOver: Double?  // copy from the host, while next in line
+    var pipes: [Int: (Line, Line)] = [:]   // relayed connections: far Mac <-> its host
+    var dial: ((String, Int) -> Line?)?    // opens a line toward a host (set by the app, used to relay)
+    private var listener: NWListener?, timers: [Timer] = [], nextID = 0
+    let id = UUID().uuidString, since = Date().timeIntervalSince1970
 
     init(retention: Double) { self.retention = retention }
 
-    /// `advertise`: name shown in other Macs' host list (the host's username, not the machine name). nil = loopback only.
-    func start(advertise: String?) {
+    /// `advertise` = announce on the network (as "psst-…", never the username: everyone hosts, invisible people too).
+    func start(port: NWEndpoint.Port, advertise: Bool) {
         let params = tcp()
         params.allowLocalEndpointReuse = true
         guard let l = try? NWListener(using: params, on: port) else { return NSLog("psst: can't listen on \(port)") }
-        if let advertise { l.service = NWListener.Service(name: advertise, type: serviceType) }
         l.stateUpdateHandler = { if case .failed(let e) = $0 { NSLog("psst: listener failed: \(e)") } }
         l.newConnectionHandler = { [weak self] conn in
             guard let self else { return conn.cancel() }
             self.nextID += 1
             let id = self.nextID, line = Line(conn)
-            line.onMsg = { [weak self] in self?.handle(id, $0) }
+            var first = true
+            line.onMsg = { [weak self, weak line] m in
+                defer { first = false }
+                if first, m.t == "via", let line { self?.relay(id, line, to: m.text ?? "", hops: Int(m.ts ?? 0)) } else { self?.handle(id, m) }
+            }
             line.onClose = { [weak self] in self?.remove(id) }
             self.add(id, send: line.send, close: line.close)
             line.start()
         }
         l.start(queue: .main)
         listener = l
-        timer = .scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.purge() }
+        if advertise { self.advertise(up: "", upSince: .infinity, hops: 0) }
+        timers = [.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.purge() },
+                  .scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in  // "still here" for the next in line
+                      self?.successors.forEach { self?.clients[$0]?.send(Msg(t: "rep")) } }]
+    }
+
+    /// Tells nearby Macs which host this Mac is on, so ones that can't reach it over Wi-Fi can go through here.
+    func advertise(up: String, upSince: Double, hops: Int) {
+        listener?.service = NWListener.Service(name: "psst-" + id.prefix(8), type: serviceType, txtRecord: NWTXTRecord(
+            ["id": id, "since": String(since), "up": up, "upsince": String(upSince), "hops": String(hops)]))
     }
 
     func stop() {
         listener?.cancel()
-        timer?.invalidate()
+        timers.forEach { $0.invalidate() }
         clients.values.forEach { $0.close() }
         clients = [:]
+        pipes.values.forEach { $0.0.close(); $0.1.close() }
     }
 
     func add(_ id: Int, send: @escaping (Msg) -> Void, close: @escaping () -> Void) {
@@ -489,6 +564,18 @@ final class Server {
         for r in Array(requests.keys) { requests[r]?.removeAll { $0 == id } }
         roster()
         roomList()
+        sync()
+    }
+
+    /// Passes a far Mac's traffic on toward the host it can't reach over Wi-Fi itself.
+    func relay(_ id: Int, _ down: Line, to host: String, hops: Int) {
+        clients[id] = nil
+        guard hops < maxHops, let up = dial?(host, hops + 1) else { return down.close() }
+        pipes[id] = (down, up)
+        down.onMsg = { [weak up] in up?.send($0) }
+        up.onMsg = { [weak down] in down?.send($0) }
+        down.onClose = { [weak self, weak up] in up?.close(); self?.pipes[id] = nil }
+        up.onClose = { [weak self, weak down] in down?.close(); self?.pipes[id] = nil }
     }
 
     /// Deletes a room: everyone in it is sent back to public, its invites and history are erased.
@@ -502,6 +589,7 @@ final class Server {
         owners[room] = nil
         invites[room] = nil
         requests[room] = nil
+        restore[room] = nil
         history.removeAll { $0.room == room }
         roomList()
     }
@@ -509,6 +597,7 @@ final class Server {
     // ponytail: no rate limit; one client can flood. Add a per-client token bucket here if that happens.
     func handle(_ id: Int, _ m: Msg) {
         guard var c = clients[id] else { return }
+        defer { sync() }
         let room = clean(m.room ?? "public", lower: true)
         func note(_ text: String, _ r: String? = nil) { c.send(Msg(t: "note", room: r, text: text)) }
 
@@ -517,11 +606,18 @@ final class Server {
             c.name = unique(clean(m.from ?? ""), id)
             c.hidden = m.hidden ?? false
             c.key = validKey(m.key) ?? c.key
+            c.since = m.since ?? c.since
+            c.ready = true
             clients[id] = c
             c.send(Msg(t: "you", from: c.name))
-            if m.t == "hello" { replay("public", to: c); c.send(Msg(t: "rooms", counts: roomCounts())) }
+            if m.t == "hello" {
+                replay("public", to: c, after: m.ts ?? 0)  // only what they haven't seen
+                if tookOver == nil, !restore.isEmpty { takeOver() }
+                restoreRooms(id)
+                c.send(Msg(t: "rooms", counts: roomCounts()))
+            }
             roster()
-            for r in c.rooms where r != "public" { members(r) }
+            for r in clients[id]?.rooms ?? [] where r != "public" { members(r) }
 
         case "say":
             guard c.rooms.contains(room) else { return }
@@ -541,6 +637,7 @@ final class Server {
             history.append(out)
             if history.count > maxHistory { history.removeFirst(history.count - maxHistory) }
             send(out, to: room)
+            successors.forEach { clients[$0]?.send(Msg(t: "rep", batch: [out])) }
 
         case "create":
             guard !room.isEmpty, room != "public", owners[room] == nil else { return note("#\(room) is taken") }
@@ -593,8 +690,8 @@ final class Server {
 
         case "invite":
             let name = clean(m.text ?? "")
-            guard room != "public", c.rooms.contains(room) else { return note("make a room first: /room name") }
-            guard let target = clients.first(where: { $0.value.name == name && !$0.value.hidden })
+            guard room != "public", c.rooms.contains(room) else { return note("make a room first: /room <room name>") }
+            guard let target = clients.first(where: { $0.value.ready && $0.value.name == name && !$0.value.hidden })
             else { return note("no one named \(name)") }  // invisible people can't be found by name either
             guard !target.value.rooms.contains(room) else { return note("\(name) is already here", room) }
             invites[room, default: []].insert(target.key)
@@ -633,6 +730,79 @@ final class Server {
         replay(room, to: c)
     }
 
+    // MARK: Hand-over
+
+    /// Keeps the next two in line (the oldest other hosts among the clients, who'd be elected next) supplied with
+    /// rooms and messages: a full copy when someone becomes next in line, then every change.
+    func sync() {
+        let next = clients.compactMap { id, c in c.since.flatMap { $0 != since ? (id, $0) : nil } }
+            .sorted { ($0.1, $0.0) < ($1.1, $1.0) }.prefix(2).map(\.0)
+        let snap = snapshot()
+        for id in next {
+            guard let c = clients[id] else { continue }
+            if !successors.contains(id) {
+                c.send(Msg(t: "rep", text: "reset", snap: snap))
+                history.forEach { c.send(Msg(t: "rep", batch: [$0])) }
+            } else if snap != lastSnap { c.send(Msg(t: "rep", snap: snap)) }
+        }
+        successors = next
+        lastSnap = snap
+    }
+
+    func snapshot() -> Snapshot {
+        var s = Snapshot()
+        for (room, owner) in owners {
+            var r = restore[room] ?? Snapshot.Room()  // people not back yet after a takeover stay in the copy
+            if let o = clients[owner] { r.owner = o.name }
+            for c in clients.values where c.rooms.contains(room) && !c.key.isEmpty {
+                r.members[c.name] = c.key
+                r.nicks[c.name] = c.nicks[room]
+            }
+            r.invites = Set(r.invites + (invites[room] ?? []).compactMap { clients[$0]?.name }).sorted()
+            r.requests = r.requests + (requests[room] ?? []).compactMap { clients[$0]?.name }.filter { !r.requests.contains($0) }
+            s.rooms[room] = r
+        }
+        return s
+    }
+
+    /// While next in line: takes in the host's copy.
+    func absorb(_ m: Msg) {
+        lastRep = Date().timeIntervalSince1970
+        if m.text == "reset" { history = []; restore = [:] }
+        if let snap = m.snap { restore = snap.rooms }
+        history += m.batch ?? []
+        if history.count > maxHistory { history.removeFirst(history.count - maxHistory) }
+    }
+
+    /// The old host is gone and people are arriving here: its rooms come back. A copy that stopped being kept
+    /// up to date over a minute ago (this Mac wasn't next in line any more) is stale and dropped.
+    func takeOver() {
+        let now = Date().timeIntervalSince1970
+        guard now - lastRep < 60 else { restore = [:]; return }
+        for room in restore.keys where owners[room] == nil { owners[room] = -1 }
+        tookOver = now
+        roomList()
+    }
+
+    /// Puts a returning Mac back in its rooms. Only the same name with the same key gets back in.
+    func restoreRooms(_ id: Int) {
+        guard var c = clients[id], !c.key.isEmpty, tookOver != nil else { return }
+        for (room, var r) in restore where owners[room] != nil {
+            if r.members[c.name] == c.key {
+                r.members[c.name] = nil
+                c.rooms.insert(room)
+                c.nicks[room] = r.nicks.removeValue(forKey: c.name)
+                if r.owner == c.name { owners[room] = id; r.owner = "" }
+                c.send(Msg(t: "joined", room: room, text: "restored"))
+            }
+            if r.invites.contains(c.name) { invites[room, default: []].insert(id); r.invites.removeAll { $0 == c.name } }
+            if r.requests.contains(c.name) { requests[room, default: []].append(id); r.requests.removeAll { $0 == c.name } }
+            restore[room] = r
+        }
+        clients[id] = c
+        roomList()
+    }
+
     func roomCounts() -> [String: Int] {
         Dictionary(uniqueKeysWithValues: owners.keys.map { r in (r, clients.values.filter { $0.rooms.contains(r) }.count) })
     }
@@ -647,12 +817,12 @@ final class Server {
         for c in clients.values where c.rooms.contains(room) { c.send(m) }
     }
 
-    func replay(_ room: String, to c: Client) {
-        for m in history where m.room == room { c.send(m) }
+    func replay(_ room: String, to c: Client, after: Double = 0) {
+        for m in history where m.room == room && (m.ts ?? 0) > after { c.send(m) }
     }
 
     func roster() {
-        let shown = clients.values.filter { !$0.hidden }
+        let shown = clients.values.filter { $0.ready && !$0.hidden }
         let keys = Dictionary(shown.filter { !$0.key.isEmpty }.map { ($0.name, $0.key) }, uniquingKeysWith: { a, _ in a })
         for c in clients.values { c.send(Msg(t: "who", names: shown.map(\.name).sorted(), keys: keys)) }
     }
@@ -668,12 +838,17 @@ final class Server {
         let now = Date().timeIntervalSince1970
         history.removeAll { ($0.ts ?? 0) < now - retention }
         lastAsk = lastAsk.filter { now - $0.value < 60 }
+        if let t = tookOver, now - t > 60 {  // a minute after taking over: rooms whose creator never came back close
+            for (room, owner) in owners where owner == -1 { close(room) }
+            restore = [:]
+            tookOver = nil
+        }
     }
 
     func unique(_ base: String, _ id: Int) -> String {
         let base = base.isEmpty ? "anon" : base
         var name = base, i = 2
-        while clients.contains(where: { $0.key != id && $0.value.name == name }) { name = "\(base)\(i)"; i += 1 }
+        while clients.contains(where: { $0.key != id && $0.value.ready && $0.value.name == name }) { name = "\(base)\(i)"; i += 1 }
         return name
     }
 }
@@ -747,6 +922,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     var line: Line?
     var browser: NWBrowser?
     var hosts: [NWBrowser.Result] = [], attempts = 0
+    var fails: [String: Int] = [:], downUntil: [String: Date] = [:], sleptAt: Date?  // see electHost, onWake
+    var viaID = "", viaSince = 0.0, dialed = "", hops = 0  // the host this Mac is on, the Mac it dialled, how far
+    var prevRoom = "public", lastSeen = 0.0  // to pick up where we were after reconnecting
     var me = "", room = "public", via = "", roster: [String] = [], rooms: Set<String> = [], invited: Set<String> = []
     let status = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     let stack = NSStackView(), field = NSTextField(), hintLabel = NSTextField(wrappingLabelWithString: "")
@@ -758,6 +936,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     let box = NSStackView(), welcomeText = NSTextField(wrappingLabelWithString: "")
     let nameField = NSTextField(), nameNote = NSTextField(wrappingLabelWithString: "")
     let lockBox = NSButton(checkboxWithTitle: "Lock overlay position", target: nil, action: nil)
+    let loginBox = NSButton(checkboxWithTitle: "Open Psst at login", target: nil, action: nil)
     let saveButton = NSButton(title: "Save", target: nil, action: nil)
     let shortcutButton = NSButton(title: "", target: nil, action: nil)
     var recorder: Any?  // key monitor while a new shortcut is being typed
@@ -795,16 +974,21 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         registerHotKey()
         if name == nil { showSettings(welcome: true) }  // first launch: pick a username before anything connects
         checkForUpdate()
-        Timer.scheduledTimer(withTimeInterval: 6 * 3600, repeats: true) { [weak self] _ in self?.checkForUpdate() }
+        Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { [weak self] _ in self?.checkForUpdate() }
+        Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in self?.regroup() }
+        let ws = NSWorkspace.shared.notificationCenter
+        ws.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in self?.sleptAt = Date() }
+        ws.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in self?.onWake() }
 
-        let b = NWBrowser(for: .bonjour(type: serviceType, domain: nil), using: tcp())
+        let b = NWBrowser(for: .bonjourWithTXTRecord(type: serviceType, domain: nil), using: tcp())
         b.browseResultsChangedHandler = { [weak self] results, _ in
-            self?.hosts = Array(results)
-            self?.connect()
+            guard let self else { return }
+            self.hosts = Array(results)
+            self.regroup()
         }
         b.start(queue: .main)
         browser = b
-        if d.bool(forKey: "hosting") { setHosting(true) }
+        startHost()
     }
 
     func buildUI() {
@@ -1062,9 +1246,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
             if openRooms[r] != nil { return note("you're not in #\(r). /request \(r) to ask to join") }
         }
         switch parts[0] {  // these work without a host
-        case "/host":
-            setHosting(server == nil)
-            return note(server == nil ? "stopped hosting" : "hosting on this Mac as \(name ?? ""); others on the network will find it")
         case "/quit": return NSApp.terminate(nil)
         case "/settings": return showSettings(welcome: false)
         case "/friend": return note(friend(arg))
@@ -1086,7 +1267,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
             return note("trusting \(who)'s new key \(fingerprint(k))")
         default: break
         }
-        guard let line, !me.isEmpty else { return note("not connected: no host yet. /host to start one") }
+        guard let line, !me.isEmpty else { return note("not connected yet: looking for other Macs running Psst") }
         switch parts[0] {
         case "/room" where arg.isEmpty: note("#\(room): " + guide.members.joined(separator: ", "))
         case "/room": line.send(Msg(t: "create", room: arg))
@@ -1120,7 +1301,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         let r = m.room ?? "public", tag = r == "public" ? "" : "#\(r) ", from = m.from ?? "?"
         if blocked.contains(from), m.t == "say" || m.t == "invite" || m.t == "request" { return }
         switch m.t {
-        case "you": me = m.from ?? ""; attempts = 0; status.button?.appearsDisabled = false
+        case "you":
+            me = m.from ?? ""
+            attempts = 0
+            fails[dialed] = nil
+            status.button?.appearsDisabled = false
+            server?.advertise(up: viaID, upSince: viaSince, hops: hops)  // Macs out of range can come through here
+        case "rep": server?.absorb(m)  // this Mac is next in line to host
         case "who":
             roster = m.names ?? []
             learn(m.keys ?? [:])
@@ -1135,7 +1322,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
             requests[r, default: []].append(from)
             lastAsked = r
             show("#\(r) \(from) is requesting to join. Do /accept to accept.")
-        case "joined": rooms.insert(r); invited.remove(r); setRoom(r)
+        case "joined":  // "restored": back in a room after the host changed; stay in the room we were in
+            rooms.insert(r)
+            invited.remove(r)
+            if m.text != "restored" || r == prevRoom { setRoom(r) }
         case "left": rooms.remove(r); members[r] = nil; nicks[r] = nil; requests[r] = nil; if r == room { setRoom("public") }
         case "invite":
             let policy = d.string(forKey: "invites")
@@ -1144,6 +1334,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
             show("\(from) invited you to #\(r). /join \(r)")
         case "note": show(tag + (m.text ?? ""), dim: true)
         case "say":
+            lastSeen = max(lastSeen, m.ts ?? 0)
             var text = m.text ?? ""
             if r != "public" {  // private: must open with the sender's trusted key, or it isn't shown
                 guard let ct = m.ct, let wrap = m.wraps?[me], let key = members[r]?[from] ?? known[from], pins[from] == key,
@@ -1171,39 +1362,90 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         }
     }
 
-    func hostName(_ r: NWBrowser.Result) -> String {
-        if case .service(let name, _, _, _) = r.endpoint { return name }
-        return "\(r.endpoint)"
+    func ad(_ r: NWBrowser.Result) -> HostAd? {  // nil: an older Psst, not part of the election
+        guard case .bonjour(let t) = r.metadata, let id = t["id"], let since = t["since"].flatMap(Double.init) else { return nil }
+        return HostAd(id: id, since: since, up: t["up"] ?? "", upSince: t["upsince"].flatMap(Double.init) ?? .infinity,
+                      hops: t["hops"].flatMap(Int.init) ?? maxHops)
+    }
+    var ads: [HostAd] { hosts.compactMap(ad) }
+    var down: Set<String> { Set(downUntil.filter { $0.value > Date() }.keys) }
+
+    /// The host this Mac should be on (see electHost).
+    func target() -> HostAd? { electHost(own: server.map { HostAd(id: $0.id, since: $0.since) }, ads: ads, down: down) }
+
+    /// Opens a started line toward `host`: loopback, straight to it, or through a Mac that reaches it.
+    /// Returns the Mac actually dialled (marked down if it keeps failing) and this Mac's distance to the host.
+    func dial(_ host: String, hops: Int, pin: Bool = false) -> (line: Line, through: String, hops: Int)? {
+        guard let r = route(to: host, own: server?.id, ads: ads, down: down) else { return nil }
+        let l: Line, through: String, dist: Int
+        switch r {
+        case .local:
+            l = Line(NWConnection(to: .hostPort(host: "127.0.0.1", port: port), using: tcp()))
+            (through, dist) = (host, 0)
+        case .direct(let a), .relay(let a):
+            guard let res = hosts.first(where: { ad($0)?.id == a.id }) else { return nil }
+            let params = tcp()
+            if pin {  // a Mac is often reachable over several links (school Wi-Fi, peer-to-peer); each retry pins the next,
+                      // so a network that silently drops traffic can't trap us on it
+                let links: [NWInterface?] = [nil] + res.interfaces.filter { $0.type != .loopback }
+                params.requiredInterface = links[attempts % links.count]
+                attempts += 1
+            }
+            l = Line(NWConnection(to: res.endpoint, using: params))
+            (through, dist) = (a.id, r == .direct(a) ? 1 : a.hops + 1)
+        }
+        l.start()
+        if case .relay(_) = r { l.send(Msg(t: "via", text: host, ts: Double(hops))) }
+        return (l, through, dist)
     }
 
-    /// Connects to: this Mac if hosting, else the host picked in the menu, else the first one found.
-    /// A host is often reachable over several links (school Wi-Fi, direct peer-to-peer). The first try lets macOS pick;
-    /// each retry pins the next link, so a network that silently drops traffic can't trap us on it.
-    func connect() {
-        guard line == nil, name != nil else { return }
-        let ep: NWEndpoint
-        var pin: NWInterface? = nil
-        if server != nil {
-            ep = .hostPort(host: "127.0.0.1", port: port)
-            via = "this Mac"
-        } else if let r = hosts.first(where: { hostName($0) == d.string(forKey: "host") }) ?? hosts.first {
-            let routes: [NWInterface?] = [nil] + r.interfaces.filter { $0.type != .loopback }
-            pin = routes[attempts % routes.count]
-            attempts += 1
-            ep = r.endpoint
-            via = hostName(r)
-        } else { return }
+    /// Keeps this Mac on the shared host: connects if it isn't, and moves when a better host appears,
+    /// but only once that host answers, so a stale listing never pulls people off a host that works.
+    func regroup() {
+        guard let line else { return connect() }
+        guard !me.isEmpty, let want = target(), want.id != viaID else { return }
+        switch route(to: want.id, own: server?.id, ads: ads, down: down) {
+        case .local?, .relay?: line.close()  // this Mac's own host answers; a relaying Mac is on it right now
+        case .direct(let a)?:
+            guard let res = hosts.first(where: { ad($0)?.id == a.id }) else { return }
+            let probe = NWConnection(to: res.endpoint, using: tcp())
+            probe.stateUpdateHandler = { [weak self] state in
+                if case .ready = state, let self, self.line === line { line.close() }  // reconnect lands on `want`
+            }
+            probe.start(queue: .main)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+                if case .ready = probe.state {} else { self?.downUntil[a.id] = Date() + 60 }
+                probe.cancel()
+            }
+        case nil: break
+        }
+    }
 
-        let params = tcp()
-        params.requiredInterface = pin
-        let l = Line(NWConnection(to: ep, using: params))
-        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self, weak l] in  // no answer in 8 s: next link
+    /// A Mac that slept a while gave up its place: restarting its host makes it the newest, so people stay with
+    /// whoever took over instead of all moving back. Also a good moment to look for updates.
+    func onWake() {
+        checkForUpdate()
+        if Date().timeIntervalSince(sleptAt ?? Date()) > 30 { startHost() }
+    }
+
+    func connect() {
+        guard line == nil, name != nil, let host = target(), let link = dial(host.id, hops: 0, pin: true) else { return }
+        (viaID, viaSince, dialed, hops) = (host.id, host.since, link.through, link.hops)
+        via = hops == 0 ? "hosting here" : hops == 1 ? "host nearby" : "through \(hops - 1) Mac\(hops > 2 ? "s" : "")"
+        let l = link.line
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self, weak l] in  // no answer in 8 s: try again
             if let self, let l, self.line === l, self.me.isEmpty { l.close() }
         }
         line = l
         l.onMsg = { [weak self] in self?.got($0) }
         l.onClose = { [weak self, weak l] in
             guard let self, self.line === l else { return }
+            if self.me.isEmpty {  // never got in: after two misses, try other ways for a minute
+                self.fails[self.dialed, default: 0] += 1
+                if self.fails[self.dialed]! >= 2 { self.downUntil[self.dialed] = Date() + 60; self.fails[self.dialed] = nil }
+            }
+            self.server?.advertise(up: "", upSince: .infinity, hops: 0)
+            self.prevRoom = self.room
             self.line = nil
             self.me = ""
             self.roster = []
@@ -1216,20 +1458,18 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
             self.status.button?.appearsDisabled = true
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.connect() }
         }
-        l.start()
-        l.send(Msg(t: "hello", from: name, hidden: d.bool(forKey: "invisible"), key: publicKey(identity)))
+        l.send(Msg(t: "hello", from: name, ts: lastSeen, hidden: d.bool(forKey: "invisible"), key: publicKey(identity),
+                   since: server?.since))
     }
 
-    func setHosting(_ on: Bool) {
+    /// Every Mac hosts (see electHost). Restarting makes this one the newest host, e.g. after sleeping.
+    func startHost() {
         server?.stop()
-        server = nil
-        if on {
-            let s = Server(retention: d.double(forKey: "retention"))
-            s.start(advertise: name)  // the host list shows the username, not the machine name
-            server = s
-        }
-        d.set(on, forKey: "hosting")
-        if let line { line.close() } else { connect() }  // reconnect to the right host
+        let s = Server(retention: d.double(forKey: "retention"))
+        s.dial = { [weak self] host, hops in self?.dial(host, hops: hops)?.line }
+        s.start(port: port, advertise: true)
+        server = s
+        if let line { line.close() } else { connect() }
     }
 
     // MARK: Menus
@@ -1249,7 +1489,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
             add("Reset position", #selector(resetPosition))
             return
         }
-        add(me.isEmpty ? "Looking for a host…" : "\(me) in #\(room) via \(via)")
+        add(me.isEmpty ? "Looking for other Macs…" : "\(me) in #\(room) · \(via)")
         add("Write…   \(shortcut)", #selector(toggleInput))
         menu.addItem(.separator())
 
@@ -1257,10 +1497,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         for n in roster where n != me {
             add((friends.contains(n) ? "★ " : "") + n, room == "public" ? nil : #selector(invite(_:)), n, indent: true)
         }
-        menu.addItem(.separator())
-
-        add(server == nil ? "Hosts on this network" : "Hosting on this Mac (/host to stop)")
-        for h in Set(hosts.map(hostName)).sorted() { add(h, #selector(pickHost(_:)), h, on: h == via, indent: true) }
         menu.addItem(.separator())
 
         add("Settings…", #selector(openSettings))
@@ -1312,7 +1548,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         welcomeText.stringValue = """
             Chat with people on this network. Messages fade away and nothing is saved.
             \(shortcut) opens the chat bar. Type / for commands, :name for emoji, **bold** for markdown.
-            One person types /host and everyone else connects on their own.
+            Psst finds other Macs running it and connects on its own, no setup needed.
             Drag the bubbles to move them; right-click to lock them in place.
             """
         box.setFrameSize(box.fittingSize)
@@ -1339,6 +1575,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         nameNote.preferredMaxLayoutWidth = 260
         lockBox.target = self
         lockBox.action = #selector(lockChanged)
+        loginBox.target = self
+        loginBox.action = #selector(loginChanged)
         shortcutButton.target = self
         shortcutButton.action = #selector(recordShortcut)
         shortcutButton.title = shortcut
@@ -1361,6 +1599,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
             [label("Messages fade after"), popups[2]],
             [label("When hosting, erase history after"), popups[3]],
             [NSGridCell.emptyContentView, lockBox],
+            [NSGridCell.emptyContentView, loginBox],
         ])
         grid.column(at: 0).xPlacement = .trailing
         grid.rowAlignment = .firstBaseline
@@ -1402,6 +1641,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
             p.selectItem(at: p.itemArray.firstIndex { ($0.representedObject as? NSObject)?.isEqual(current) == true } ?? 0)
         }
         lockBox.state = d.bool(forKey: "locked") ? .on : .off
+        if #available(macOS 13, *) { loginBox.state = SMAppService.mainApp.status == .enabled ? .on : .off } else {
+            loginBox.isEnabled = false
+            loginBox.title = "Open Psst at login (needs macOS 13; use System Preferences › Login Items)"
+        }
         popups[4].itemArray.first?.image = swatch(nameColor(name ?? "", nil))  // what Auto gives this name
         shortcutButton.title = shortcut
     }
@@ -1462,9 +1705,34 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     }
 
     @objc func saveName() {
+        let first = name == nil
         let result = setName(nameField.stringValue)
         refreshSettings()
         nameNote.stringValue = result
+        if first, name != nil { askLoginItem() }  // setup: once the username is picked
+    }
+
+    @objc func loginChanged() { setLoginItem(loginBox.state == .on) }
+
+    func setLoginItem(_ on: Bool) {
+        guard #available(macOS 13, *) else { return }
+        do {
+            if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+            if SMAppService.mainApp.status == .requiresApproval { SMAppService.openSystemSettingsLoginItems() }  // macOS wants a yes
+        } catch {
+            show("couldn't change Open at Login: \(error.localizedDescription)", dim: true)
+        }
+        refreshSettings()
+    }
+
+    func askLoginItem() {
+        guard #available(macOS 13, *), SMAppService.mainApp.status != .enabled, let w = settings else { return }
+        let a = NSAlert()
+        a.messageText = "Open Psst when you log in?"
+        a.informativeText = "Then you're reachable without starting it every day. You can change this in Settings."
+        a.addButton(withTitle: "Open at Login")
+        a.addButton(withTitle: "Not Now")
+        a.beginSheetModal(for: w) { [weak self] r in if r == .alertFirstButtonReturn { self?.setLoginItem(true) } }
     }
 
     func windowWillClose(_ n: Notification) {
@@ -1508,11 +1776,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     }
 
     @objc func invite(_ i: NSMenuItem) { line?.send(Msg(t: "invite", room: room, text: i.representedObject as? String)) }
-
-    @objc func pickHost(_ i: NSMenuItem) {
-        d.set(i.representedObject as? String, forKey: "host")
-        if server != nil { setHosting(false) } else { line?.close() }
-    }
 }
 
 // MARK: - Self-test (host routing + one real TCP round trip)
@@ -1729,22 +1992,110 @@ func selftest() {
     s.handle(2, Msg(t: "create", room: "math"))
     check(s.owners["math"] == 2, "a closed room's name is free again")
 
-    // Real listener + framing over loopback.
-    let net = Server(retention: 60)
-    net.start(advertise: nil)
+    // Hand-over: the next host in line keeps a copy, and people get their rooms back when it takes over
+    let h = Server(retention: 600), next = Server(retention: 600)
+    var hin: [Int: [Msg]] = [:]
+    let K = (0..<4).map { _ in publicKey(Identity()) }
+    for id in 1...4 { h.add(id, send: { m in hin[id, default: []].append(m); if id == 2, m.t == "rep" { next.absorb(m) } }, close: {}) }
+    h.handle(1, Msg(t: "hello", from: "hana", key: K[0], since: h.since))  // the host's own Mac
+    h.handle(2, Msg(t: "hello", from: "nell", key: K[1], since: 50))
+    h.handle(3, Msg(t: "hello", from: "ollie", key: K[2], since: 70))
+    h.handle(4, Msg(t: "hello", from: "pia", key: K[3], since: 90))
+    check(h.successors == [2, 3], "the two oldest other hosts are next in line, never the host itself")
+    h.handle(3, Msg(t: "create", room: "lab"))
+    h.handle(3, Msg(t: "invite", room: "lab", text: "nell"))
+    h.handle(2, Msg(t: "join", room: "lab"))
+    h.handle(2, Msg(t: "alias", room: "lab", text: "Nn"))
+    h.handle(3, Msg(t: "invite", room: "lab", text: "pia"))
+    h.handle(1, Msg(t: "create", room: "gym"))  // made by the host's own user, who leaves with the host
+    h.handle(1, Msg(t: "say", text: "before"))
+    h.handle(3, Msg(t: "say", room: "lab", ct: "LAB", wraps: [:]))
+    let lab = next.restore["lab"]
+    check(lab?.members == ["nell": K[1], "ollie": K[2]] && lab?.owner == "ollie" && lab?.invites == ["pia"] && lab?.nicks == ["nell": "Nn"],
+          "next in line has the rooms: \(String(describing: lab))")
+    check(next.history.contains { $0.text == "before" } && next.history.contains { $0.ct == "LAB" }, "next in line has the messages")
+    let seen = next.history.first { $0.text == "before" }?.ts
+    var nin: [Int: [Msg]] = [:]
+    for id in 1...4 { next.add(id, send: { nin[id, default: []].append($0) }, close: {}) }
+    next.handle(1, Msg(t: "hello", from: "nell", ts: seen, key: K[1], since: next.since))  // the old host is gone
+    check(next.clients[1]?.rooms.contains("lab") == true && next.clients[1]?.nicks["lab"] == "Nn"
+          && nin[1]!.contains { $0.t == "joined" && $0.text == "restored" }, "back in the room after the host changed")
+    check(!nin[1]!.contains { $0.text == "before" }, "no repeats of messages already seen")
+    next.handle(2, Msg(t: "hello", from: "ollie", key: publicKey(Identity())))
+    check(next.clients[2]?.rooms.contains("lab") == false && next.owners["lab"] == -1, "same name from another Mac doesn't get in")
+    next.remove(2)
+    next.handle(3, Msg(t: "hello", from: "ollie", key: K[2]))
+    check(next.clients[3]?.rooms.contains("lab") == true && next.owners["lab"] == 3, "the creator gets the room back")
+    next.handle(4, Msg(t: "hello", from: "pia", key: K[3]))
+    next.handle(4, Msg(t: "join", room: "lab"))
+    check(next.clients[4]?.rooms.contains("lab") == true, "invites carry over")
+    next.tookOver! -= 61
+    next.purge()
+    check(next.owners["gym"] == nil && next.owners["lab"] == 3, "a minute on, rooms whose creator never came back close")
+    h.remove(2)
+    check(h.successors == [3, 4] && hin[4]!.contains { $0.t == "rep" && $0.text == "reset" }, "a new next in line gets a full copy")
+    let stale = Server(retention: 600)
+    stale.absorb(Msg(t: "rep", text: "reset", snap: h.snapshot()))
+    stale.lastRep -= 120
+    stale.add(1, send: { _ in }, close: {})
+    stale.handle(1, Msg(t: "hello", from: "ollie", key: K[2]))
+    check(stale.clients[1]?.rooms == ["public"] && stale.restore.isEmpty, "an out-of-date copy is dropped")
+
+    // Electing one host and finding a way to it
+    let hA = HostAd(id: "a", since: 100), hB = HostAd(id: "b", since: 200)
+    let hC = HostAd(id: "c", since: 300, up: "a", upSince: 100, hops: 1), hD = HostAd(id: "d", since: 400, up: "a", upSince: 100, hops: 2)
+    check(electHost(own: hB, ads: [hB, hA], down: []) == hA && electHost(own: hA, ads: [hB], down: []) == hA, "everyone picks the oldest host")
+    check(electHost(own: hB, ads: [hB, hC], down: []) == HostAd(id: "a", since: 100), "even one only seen through another Mac")
+    check(electHost(own: hB, ads: [hA, hC], down: ["a", "c"]) == hB, "skips Macs that stopped answering, and what they claimed")
+    check(electHost(own: nil, ads: [hA], down: ["a"]) == hA, "everyone failed: keep trying")
+    check(electHost(own: hB, ads: [HostAd(id: "e", since: 9, up: "z", upSince: 1, hops: maxHops)], down: [])?.id == "e",
+          "hosts too many hops away don't count")
+    check(route(to: "b", own: "b", ads: [hA], down: []) == .local && route(to: "a", own: "b", ads: [hA, hC], down: []) == .direct(hA),
+          "this Mac, or straight there")
+    check(route(to: "a", own: "b", ads: [hA, hD, hC], down: ["a"]) == .relay(hC), "out of reach: through the nearest Mac on it")
+    check(route(to: "a", own: "b", ads: [hC], down: ["c"]) == nil && route(to: "a", own: "b", ads: [hA], down: ["a"]) == .direct(hA),
+          "no way, or only a failing one")
+
+    // Real connections over loopback, on test ports (the real one would reach a running Psst)
+    let testPort: NWEndpoint.Port = 47831, relayPort: NWEndpoint.Port = 47832
+    let net = Server(retention: 60), mid = Server(retention: 60)
+    var dials = 0
+    mid.dial = { host, _ in
+        dials += 1
+        guard host == net.id else { return nil }
+        let l = Line(NWConnection(to: .hostPort(host: "127.0.0.1", port: testPort), using: tcp()))
+        l.start()
+        return l
+    }
+    net.start(port: testPort, advertise: false)
+    mid.start(port: relayPort, advertise: false)
     RunLoop.main.run(until: Date() + 0.3)
-    var got: [Msg] = []
-    let a = Line(NWConnection(to: .hostPort(host: "127.0.0.1", port: port), using: .tcp))
-    a.onMsg = { got.append($0) }
-    a.start()
-    a.send(Msg(t: "hello", from: "net"))
+    func talk(_ p: NWEndpoint.Port, _ out: [Msg], wait: Double = 3, until done: @escaping ([Msg]) -> Bool) -> [Msg] {
+        var got: [Msg] = []
+        let l = Line(NWConnection(to: .hostPort(host: "127.0.0.1", port: p), using: .tcp))
+        l.onMsg = { got.append($0) }
+        l.start()
+        out.forEach { l.send($0) }
+        let deadline = Date() + wait
+        while !done(got), Date() < deadline { RunLoop.main.run(until: Date() + 0.05) }
+        l.close()
+        return got
+    }
     let ping = "ping 👍🏽 한국어 é 👨‍👩‍👧"
-    a.send(Msg(t: "say", text: ping))
-    let deadline = Date() + 3
-    while !got.contains(where: { $0.text == ping }), Date() < deadline { RunLoop.main.run(until: Date() + 0.05) }
-    check(got.first?.from == "net", "tcp hello")
-    check(got.contains { $0.text == ping }, "tcp say keeps unicode intact")
+    let direct = talk(testPort, [Msg(t: "hello", from: "net"), Msg(t: "say", text: ping)]) { $0.contains { $0.text == ping } }
+    check(direct.first?.from == "net", "tcp hello")
+    check(direct.contains { $0.text == ping }, "tcp say keeps unicode intact")
+    let far = talk(relayPort, [Msg(t: "via", text: net.id, ts: 0), Msg(t: "hello", from: "far"), Msg(t: "say", text: "hi from afar")]) {
+        $0.contains { $0.text == "hi from afar" }
+    }
+    check(far.contains { $0.t == "you" && $0.from == "far" } && far.contains { $0.text == "hi from afar" },
+          "a far Mac reaches the host through one in between")
+    check(mid.clients.isEmpty, "the Mac in between only passes traffic on")
+    let tooFar = talk(relayPort, [Msg(t: "via", text: net.id, ts: Double(maxHops)), Msg(t: "hello", from: "x")], wait: 0.5) { _ in false }
+    check(dials == 1 && !tooFar.contains { $0.t == "you" }, "relaying stops after \(maxHops) hops")
     net.stop()
+    mid.stop()
+
     let key = Curve25519.Signing.PrivateKey(), blob = Data("zip bytes".utf8)
     let sig = Data(try! key.signature(for: blob).base64EncodedString().utf8)
     let pub = key.publicKey.rawRepresentation.base64EncodedString()
@@ -1752,6 +2103,9 @@ func selftest() {
     check(!verified(Data("tampered".utf8), sig: sig, key: pub), "tampered update rejected")
     check(!verified(blob, sig: sig, key: Curve25519.Signing.PrivateKey().publicKey.rawRepresentation.base64EncodedString()),
           "update signed by another key rejected")
+    let tcpOpts = tcp().defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options
+    check(tcpOpts?.enableKeepalive == true && tcp().includePeerToPeer, "keepalive notices dead links; peer-to-peer stays on")
+    check(NWTXTRecord(["id": "x", "since": "12.5"])["since"].flatMap(Double.init) == 12.5, "host start time survives the TXT record")
     check(isNewer("1.10", than: "1.9") && isNewer("1.0\n", than: "0") && !isNewer("1.2", than: "1.2") && !isNewer("1.1", than: "1.2"),
           "version compare")
     print("selftest ok")
