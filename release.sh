@@ -18,4 +18,5 @@ echo "$V" > "$OUT/version.txt"
 
 git push
 gh release create "v$V" "$OUT/Psst.zip" "$OUT/Psst.zip.sig" "$OUT/version.txt" --title "Psst $V" --generate-notes
+git fetch --tags  # the tag is made on GitHub; local builds read their version from it
 rm -rf "$OUT"

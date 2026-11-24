@@ -75,7 +75,8 @@ struct Snapshot: Codable, Equatable {
 // MARK: - Updates: signed GitHub releases
 
 let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
-let releases = "https://github.com/sbrothers7/psst/releases/latest/download/"  // not the API: no rate limit for a school sharing one IP
+let repo = "https://github.com/sbrothers7/psst"
+let releases = repo + "/releases/latest/download/"  // not the API: no rate limit for a school sharing one IP
 let updateKey = "Oyw6t/z9rkWjGdtYZdOm8b3eekjGoH1HCViAYbINriA="  // Ed25519 public key; the private half never leaves the release Mac (~/.config/psst/update.key)
 
 func isNewer(_ v: String, than current: String) -> Bool {
@@ -272,23 +273,23 @@ let emojiIndex: [(code: String, emoji: String)] = {
 
 // MARK: - Typing guide
 
-let commands: [(name: String, args: [String], help: String)] = [
-    ("/status", ["username"], "who's online; pick someone for options"),
-    ("/room", ["room name"], "people in this room; /room <room name> makes a new room"),
-    ("/rooms", ["room name"], "rooms on the network; pick one to switch or ask to join"),
-    ("/join", ["room name"], "switch to a room you're in, or join one you were invited to"),
+let commands: [(name: String, args: [String], help: String)] = [  // help fits one line of the guide
+    ("/status", ["username"], "see who is online"),
+    ("/room", ["room name"], "people here, or make a new room"),
+    ("/rooms", ["room name"], "rooms on the network"),
+    ("/join", ["room name"], "switch rooms, or join when invited"),
     ("/request", ["room name"], "ask to join a room (once a minute)"),
-    ("/accept", ["username|all"], "let in whoever asked last, someone, or everyone"),
+    ("/accept", ["username|all"], "accept room join request"),
     ("/invite", ["username"], "invite someone to this room"),
     ("/leave", [], "leave this room"),
-    ("/nick", ["nickname"], "your name in this room only; alone clears it"),
-    ("/friend", ["list|add|remove", "username"], "show friend list"),
-    ("/block", ["username"], "block or unblock someone; /block lists blocked"),
-    ("/history", [], "replay this room's recent messages"),
-    ("/settings", [], "show settings pane"),
-    ("/key", ["username"], "show a key code to compare in person; alone shows yours"),
-    ("/trust", ["username"], "accept someone's new key after comparing codes"),
-    ("/quit", [], "quit Psst (or ⌘Q)"),
+    ("/nick", ["nickname"], "set your name in this room (blank to clear)"),
+    ("/friend", ["list|add|remove", "username"], "manage friends"),
+    ("/block", ["username"], "block or unblock (blank to list)"),
+    ("/history", [], "replay recent messages"),
+    ("/settings", [], "open settings"),
+    ("/key", ["username"], "key code to compare in person"),
+    ("/trust", ["username"], "trust someone's new key"),
+    ("/quit", [], "quit Psst (⌘Q)"),
 ]
 
 /// "/friend <list|add|remove> <username>": one placeholder per parameter, written like the README.
@@ -342,7 +343,7 @@ func suggest(_ text: String, _ c: Ctx) -> [Suggestion] {
         let typed = parts[0].lowercased()
         guard parts.count == 2 else {  // still typing the command name
             return commands.filter { $0.name.hasPrefix(typed) }
-                .map { Suggestion(label: usage($0), detail: $0.help, replace: $0.args.isEmpty ? $0.name : $0.name + " ") }
+                .map { Suggestion(label: $0.name, detail: $0.help, replace: $0.args.isEmpty ? $0.name : $0.name + " ") }  // parameters show once picked
         }
         guard let cmd = commands.first(where: { $0.name == typed }) else { return [] }
         let words = parts[1].split(separator: " ", omittingEmptySubsequences: false).map(String.init)
@@ -884,6 +885,8 @@ final class Panel: NSPanel {
 }
 
 /// Blurred bubble. Dragging it moves the overlay unless locked; right-click shows its menu.
+final class Flipped: NSView { override var isFlipped: Bool { true } }  // top-down scroll content
+
 final class Bubble: NSVisualEffectView {
     override func acceptsFirstMouse(for e: NSEvent?) -> Bool { true }
     override func hitTest(_ p: NSPoint) -> NSView? {
@@ -934,6 +937,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     var hotKey: EventHotKeyRef?
     var settings: NSWindow?
     let box = NSStackView(), welcomeText = NSTextField(wrappingLabelWithString: "")
+    let tabs = NSTabView(), peopleBox = NSStackView(), aboutBox = NSStackView()  // settings tabs: General is `box`
+    let peopleScroll = NSScrollView(), peopleNote = NSTextField(labelWithString: "")
     let nameField = NSTextField(), nameNote = NSTextField(wrappingLabelWithString: "")
     let lockBox = NSButton(checkboxWithTitle: "Lock overlay position", target: nil, action: nil)
     let loginBox = NSButton(checkboxWithTitle: "Open Psst at login", target: nil, action: nil)
@@ -1203,23 +1208,37 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         guard input.isVisible, !suggestions.isEmpty || guide != nil else { return hints.orderOut(nil) }
         pick = min(pick, max(suggestions.count - 1, 0))
         let s = NSMutableAttributedString()
+        // Columns: ▸ marker | label (+ dot) | detail. Wrapped lines stay under their column instead of the left edge.
+        let per = 10, start = pick / per * per, pages = (suggestions.count + per - 1) / per  // a page at a time; arrows flip
+        let page = suggestions.enumerated().filter { (start..<start + per).contains($0.offset) }
+        let bold = NSFont.systemFont(ofSize: 12, weight: .semibold), indent: CGFloat = 14
+        let widest = page.filter { !$0.element.detail.isEmpty }.map { ($0.element.label + ($0.element.dot == nil ? "" : " ●") as NSString).size(withAttributes: [.font: bold]).width }.max() ?? 0
+        let col = indent + min(widest, 190) + 16
+        let rows = NSMutableParagraphStyle(), head = NSMutableParagraphStyle()
+        rows.tabStops = [NSTextTab(textAlignment: .left, location: indent), NSTextTab(textAlignment: .left, location: col)]
+        rows.headIndent = col
+        head.firstLineHeadIndent = indent
+        head.headIndent = indent
+        head.paragraphSpacing = 2
         if let guide {  // command format, the parameter being typed in accent color
             let line = NSMutableAttributedString(attributedString: styled(guide.label, dim: true))
             if let r = guide.label.range(of: guide.focus) {
-                line.addAttributes([.foregroundColor: NSColor.controlAccentColor,
-                                    .font: NSFont.systemFont(ofSize: 12, weight: .semibold)], range: NSRange(r, in: guide.label))
+                line.addAttributes([.foregroundColor: NSColor.controlAccentColor, .font: bold], range: NSRange(r, in: guide.label))
             }
             line.append(styled("   " + guide.help, dim: true))
+            line.addAttribute(.paragraphStyle, value: head, range: NSRange(location: 0, length: line.length))
             s.append(line)
         }
-        let per = 10, start = pick / per * per, pages = (suggestions.count + per - 1) / per  // a page at a time; arrows flip
-        for (i, g) in suggestions.enumerated() where (start..<start + per).contains(i) {
-            if s.length > 0 { s.append(styled("\n")) }
-            s.append(styled((i == pick ? "▸ " : "   ") + g.label, dim: i != pick, bold: i == pick))
-            if let on = g.dot { s.append(styled(on ? " ●" : " ○", color: on ? .systemGreen : .tertiaryLabelColor)) }
-            if !g.detail.isEmpty { s.append(styled("   " + g.detail, dim: true)) }
+        let body = NSMutableAttributedString()
+        for (i, g) in page {
+            if body.length > 0 || s.length > 0 { body.append(styled("\n")) }
+            body.append(styled((i == pick ? "▸" : "") + "\t" + g.label, dim: i != pick, bold: i == pick))
+            if let on = g.dot { body.append(styled(on ? " ●" : " ○", color: on ? .systemGreen : .tertiaryLabelColor)) }
+            if !g.detail.isEmpty { body.append(styled("\t" + g.detail, dim: true)) }
         }
-        if pages > 1 { s.append(styled("\n   page \(start / per + 1) of \(pages) · ↑↓", dim: true)) }
+        if pages > 1 { body.append(styled("\n\tpage \(start / per + 1) of \(pages) · ↑↓", dim: true)) }
+        body.addAttribute(.paragraphStyle, value: rows, range: NSRange(location: 0, length: body.length))
+        s.append(body)
         hintLabel.attributedStringValue = s
         let h = hintLabel.intrinsicContentSize.height + 10
         hints.setFrame(NSRect(x: input.frame.minX, y: input.frame.maxY + 4, width: 380, height: h), display: true)
@@ -1311,6 +1330,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         case "who":
             roster = m.names ?? []
             learn(m.keys ?? [:])
+            if settings?.isVisible == true { refreshPeople() }
         case "members":
             members[r] = m.keys ?? [:]
             nicks[r] = m.nicks ?? [:]
@@ -1551,10 +1571,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
             Psst finds other Macs running it and connects on its own, no setup needed.
             Drag the bubbles to move them; right-click to lock them in place.
             """
-        box.setFrameSize(box.fittingSize)
-        w.setContentSize(NSSize(width: box.frame.width + 40, height: box.frame.height + 40))
+        if welcome { tabs.selectTabViewItem(at: 0) }
         w.title = welcome ? "Welcome to Psst" : "Psst Settings"
         refreshSettings()
+        refreshPeople()
+        sizeSettings(w)
         NSApp.activate(ignoringOtherApps: true)
         w.makeKeyAndOrderFront(nil)
         w.makeFirstResponder(nameField.isEnabled ? nameField : nil)
@@ -1610,11 +1631,123 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         box.spacing = 18
         box.addArrangedSubview(welcomeText)
         box.addArrangedSubview(grid)
-        box.frame.origin = NSPoint(x: 20, y: 20)
-        w.contentView!.addSubview(box)
+        buildPeople(width: grid.fittingSize.width)
+        buildAbout()
+        for (title, v, centered) in [("General", box, false), ("People", peopleBox, false), ("About", aboutBox, true)] {
+            let page = NSView(), item = NSTabViewItem(identifier: title)
+            v.translatesAutoresizingMaskIntoConstraints = false
+            page.addSubview(v)
+            NSLayoutConstraint.activate(centered
+                ? [v.centerXAnchor.constraint(equalTo: page.centerXAnchor), v.centerYAnchor.constraint(equalTo: page.centerYAnchor)]
+                : [v.leadingAnchor.constraint(equalTo: page.leadingAnchor, constant: 20), v.topAnchor.constraint(equalTo: page.topAnchor, constant: 20)])
+            item.label = title
+            item.view = page
+            tabs.addTabViewItem(item)
+        }
+        w.contentView!.addSubview(tabs)
+        sizeSettings(w)
         w.center()
         return w
     }
+
+    /// The window fits the biggest tab, so switching tabs never resizes it.
+    func sizeSettings(_ w: NSWindow) {
+        let fit = [box, peopleBox, aboutBox].map(\.fittingSize)
+        let inner = NSSize(width: fit.map(\.width).max()! + 40, height: fit.map(\.height).max()! + 40)
+        tabs.frame = NSRect(x: 0, y: 0, width: 1000, height: 1000)  // to measure the tab bar and border
+        tabs.frame = NSRect(x: 12, y: 12, width: inner.width + 1000 - tabs.contentRect.width,
+                            height: inner.height + 1000 - tabs.contentRect.height)
+        w.setContentSize(NSSize(width: tabs.frame.width + 24, height: tabs.frame.height + 18))
+    }
+
+    func buildPeople(width: CGFloat) {
+        peopleScroll.hasVerticalScroller = true
+        peopleScroll.borderType = .bezelBorder
+        peopleScroll.drawsBackground = false
+        peopleScroll.widthAnchor.constraint(equalToConstant: width).isActive = true
+        peopleScroll.heightAnchor.constraint(equalToConstant: 220).isActive = true
+        let note = NSTextField(wrappingLabelWithString: "Friends and blocks are kept on this Mac only. You won't see messages or invites from people you block.")
+        note.font = .systemFont(ofSize: 11)
+        note.textColor = .secondaryLabelColor
+        note.preferredMaxLayoutWidth = width
+        peopleBox.orientation = .vertical
+        peopleBox.alignment = .leading
+        peopleBox.spacing = 10
+        [peopleNote, peopleScroll, note].forEach(peopleBox.addArrangedSubview)
+    }
+
+    /// Everyone online here, plus friends and blocked people who aren't; online first.
+    func refreshPeople() {
+        let online = Set(roster), mine = [me, name ?? ""]
+        let list = Set(roster + friends + blocked).subtracting(mine).sorted {
+            (online.contains($0) ? 0 : 1, $0.lowercased()) < (online.contains($1) ? 0 : 1, $1.lowercased())
+        }
+        let here = roster.filter { !mine.contains($0) }.count
+        peopleNote.stringValue = me.isEmpty ? "Not connected yet: looking for other Macs running Psst."
+            : here == 0 ? "No one else is online on this network yet." : "\(here) online on this network"
+        func small(_ s: String) -> NSTextField {
+            let l = NSTextField(labelWithString: s)
+            l.font = .systemFont(ofSize: 11)
+            l.textColor = .secondaryLabelColor
+            return l
+        }
+        func check(_ who: String, _ on: Bool, _ tag: Int) -> NSButton {
+            let b = NSButton(checkboxWithTitle: "", target: self, action: #selector(personToggled))
+            b.state = on ? .on : .off
+            b.identifier = NSUserInterfaceItemIdentifier(who)
+            b.tag = tag  // 0 friend, 1 blocked
+            return b
+        }
+        let rows: [[NSView]] = list.isEmpty ? [[small("People show up here once they open Psst on this network.")]]
+            : [[small("Name"), small("Friend"), small("Blocked")]] + list.map { who in
+                let t = NSMutableAttributedString(string: who, attributes: [.font: NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor.labelColor])
+                let on = online.contains(who)
+                t.append(NSAttributedString(string: on ? "  ●" : "  ○", attributes: [.font: NSFont.systemFont(ofSize: 11),
+                    .foregroundColor: on ? NSColor.systemGreen : NSColor.tertiaryLabelColor]))
+                return [NSTextField(labelWithAttributedString: t), check(who, friends.contains(who), 0), check(who, blocked.contains(who), 1)]
+            }
+        let g = NSGridView(views: rows)
+        g.rowSpacing = 6
+        g.columnSpacing = 24
+        g.rowAlignment = .firstBaseline
+        if !list.isEmpty { for c in 1...2 { g.column(at: c).xPlacement = .center } }
+        g.frame = NSRect(origin: NSPoint(x: 10, y: 8), size: g.fittingSize)
+        let doc = Flipped(frame: NSRect(x: 0, y: 0, width: g.frame.maxX + 10, height: g.frame.maxY + 8))
+        doc.addSubview(g)
+        peopleScroll.documentView = doc
+    }
+
+    @objc func personToggled(_ b: NSButton) {
+        guard let who = b.identifier?.rawValue else { return }
+        if b.tag == 0 { friends.removeAll { $0 == who }; if b.state == .on { friends.append(who) } }
+        else { blocked.removeAll { $0 == who }; if b.state == .on { blocked.append(who) } }
+    }
+
+    func buildAbout() {
+        let icon = NSImageView(image: NSApp.applicationIconImage)
+        icon.imageScaling = .scaleProportionallyUpOrDown
+        icon.widthAnchor.constraint(equalToConstant: 96).isActive = true
+        icon.heightAnchor.constraint(equalToConstant: 96).isActive = true
+        let title = NSTextField(labelWithString: "Psst")
+        title.font = .systemFont(ofSize: 20, weight: .semibold)
+        let version = NSTextField(labelWithString: "Version \(appVersion)")
+        version.textColor = .secondaryLabelColor
+        let credits = NSTextField(labelWithString: "by sbrothers7")
+        credits.font = .systemFont(ofSize: 11)
+        credits.textColor = .secondaryLabelColor
+        let link = NSButton(title: "", target: self, action: #selector(openRepo))
+        link.isBordered = false
+        link.attributedTitle = NSAttributedString(string: repo.replacingOccurrences(of: "https://", with: ""),
+                                                  attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.linkColor])
+        aboutBox.orientation = .vertical
+        aboutBox.alignment = .centerX
+        aboutBox.spacing = 4
+        [icon, title, version, NSTextField(labelWithString: "A tiny LAN chat overlay for Macs."), credits, link].forEach(aboutBox.addArrangedSubview)
+        aboutBox.setCustomSpacing(10, after: icon)
+        aboutBox.setCustomSpacing(14, after: version)
+    }
+
+    @objc func openRepo() { NSWorkspace.shared.open(URL(string: repo)!) }
 
     func popup(_ key: String, _ opts: [(String, Any)]) -> NSPopUpButton {
         let p = NSPopUpButton()
@@ -2106,7 +2239,7 @@ func selftest() {
     let tcpOpts = tcp().defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options
     check(tcpOpts?.enableKeepalive == true && tcp().includePeerToPeer, "keepalive notices dead links; peer-to-peer stays on")
     check(NWTXTRecord(["id": "x", "since": "12.5"])["since"].flatMap(Double.init) == 12.5, "host start time survives the TXT record")
-    check(isNewer("1.10", than: "1.9") && isNewer("1.0\n", than: "0") && !isNewer("1.2", than: "1.2") && !isNewer("1.1", than: "1.2"),
+    check(isNewer("1.10", than: "1.9") && isNewer("1.3.1", than: "1.3") && isNewer("1.4", than: "1.3.1") && isNewer("1.0\n", than: "0") && !isNewer("1.2", than: "1.2") && !isNewer("1.1", than: "1.2"),
           "version compare")
     print("selftest ok")
 }
