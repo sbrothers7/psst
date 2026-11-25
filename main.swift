@@ -72,6 +72,7 @@ struct Snapshot: Codable, Equatable {
         var pass: String?  // password hash, for rooms that have one
         var desc: String?  // shown when browsing rooms
         var type: Int?     // who can get in: see typeNames
+        var bans: [String]?  // names kept out by the creator
     }
     var rooms: [String: Room] = [:]
 }
@@ -80,7 +81,7 @@ struct Snapshot: Codable, Equatable {
 
 let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
 let repo = "https://github.com/sbrothers7/psst"
-let releases = repo + "/releases/latest/download/"  // not the API: no rate limit for a school sharing one IP
+let releases = repo + "/releases/latest/download/"  // not the API: no rate limit when many Macs share one IP
 let updateKey = "Oyw6t/z9rkWjGdtYZdOm8b3eekjGoH1HCViAYbINriA="  // Ed25519 public key; the private half never leaves the release Mac (~/.config/psst/update.key)
 
 /// "…/releases/tag/v1.4.0" → "1.4.0": github.com/…/releases/latest redirects to the latest release's tag, so a HEAD
@@ -132,7 +133,7 @@ struct Msg: Codable {
 // Each Mac has a long-lived X25519 key. A private-room message is sealed once with a fresh key K (ChaCha20-Poly1305);
 // K is then sealed for each member with the key derived from sender × member. The member copy authenticates the room,
 // the sender's name and a hash of the ciphertext, so a host that edits, moves or relabels a message makes it fail to open.
-// ponytail: static keys, so no forward secrecy; a stolen identity file opens old captured messages. Fine for class chat.
+// ponytail: static keys, so no forward secrecy; a stolen identity file opens old captured messages. Fine for casual LAN chat.
 
 typealias Identity = Curve25519.KeyAgreement.PrivateKey
 
@@ -224,14 +225,14 @@ let typeNames = ["invite only", "password only", "invite or password", "open acc
 let typeList = "0 invite only · 1 password only · 2 invite or password · 3 open access"
 
 /// Words /room reads as options, so they can't name a room ("current" is the room you're in).
-let reservedRooms: Set<String> = ["public", "current", "create", "set", "members"]
+let reservedRooms: Set<String> = ["public", "current", "create", "set", "member"]
 
-/// After "/room create ": [room name] [desc] [type]. A last word 0–3 is the type (default 0); quote a description that ends in a digit.
+/// After "/room create ": [room name] [type] [desc]. A second word 0–3 is the type (default 0); quote a description that starts with one.
 func createArgs(_ rest: String) -> (room: String, desc: String, type: Int) {
     var w = rest.split(separator: " ").map(String.init)
     let room = w.isEmpty ? "" : clean(w.removeFirst(), lower: true)
-    let type = w.last.flatMap { Int($0) }.flatMap { typeNames.indices.contains($0) ? $0 : nil }
-    if type != nil { w.removeLast() }
+    let type = w.first.flatMap { Int($0) }.flatMap { typeNames.indices.contains($0) ? $0 : nil }
+    if type != nil { w.removeFirst() }
     return (room, unquote(Substring(w.joined(separator: " "))), type ?? 0)
 }
 
@@ -397,6 +398,61 @@ let commands: [(name: String, args: [String], help: String)] = [  // help fits o
     ("/quit", [], "quit Psst (⌘Q)"),
 ]
 
+/// While typing a room description (/room create … or /room … set desc …), wraps it in quotes so its spaces aren't
+/// read as more parameters. The new text and where the cursor goes (inside the closing quote), or nil when nothing changes.
+func quoteDesc(_ text: String) -> (text: String, cursor: Int)? {
+    let w = text.split(separator: " ", omittingEmptySubsequences: false).map(String.init)
+    guard w.count > 2, w[0].lowercased() == "/room" else { return nil }
+    var at: Int  // the description's first word
+    if w[1].lowercased() == "create" {
+        guard w.count > 3 else { return nil }  // still on the room name
+        at = typeNames.indices.contains(Int(w[3]) ?? -1) ? 4 : 3  // after the type, if one was given
+    } else if let s = w.firstIndex(where: { $0.lowercased() == "set" }), s <= 2, w.count > s + 2, w[s + 1].lowercased() == "desc" {
+        at = s + 2
+    } else { return nil }
+    guard w.count > at else { return nil }
+    let desc = w[at...].joined(separator: " ")
+    guard let f = desc.first, !"\"“".contains(f) else { return nil }
+    let new = w[..<at].joined(separator: " ") + " \"" + desc + "\""
+    return (new, (new as NSString).length - 1)
+}
+
+/// Markdown markers pair up while typing a message: *, ` and ~ bring their closer, typing a closer steps over it, and a
+/// second * or ~ in an empty pair doubles it (**bold**, ~~strike~~). Only at a word's edge, so 2*3 stays as typed.
+/// What to insert at the cursor (which then moves one right): "" steps over; nil types the key as usual.
+func autoPair(_ text: String, at i: Int, typed: String) -> String? {
+    let s = text as NSString
+    guard ["*", "`", "~"].contains(typed), !text.hasPrefix("/"), i <= s.length else { return nil }
+    func char(_ j: Int) -> String { j >= 0 && j < s.length ? s.substring(with: NSRange(location: j, length: 1)) : " " }  // edges count as space
+    func blank(_ j: Int) -> Bool { char(j).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    var l = 0, r = 0
+    while char(i - 1 - l) == typed { l += 1 }
+    while char(i + r) == typed { r += 1 }
+    if l > 0, l == r, blank(i - 1 - l), typed != "`" { return typed + typed }  // *|* → **|**
+    if r > 0 { return "" }
+    return l == 0 && blank(i - 1) && blank(i) ? typed + typed : nil
+}
+
+/// Backspace inside an empty pair (*|*) takes out both.
+func emptyPair(_ text: String, at i: Int) -> Bool {
+    let s = text as NSString
+    guard i > 0, i < s.length, !text.hasPrefix("/") else { return false }
+    let a = s.substring(with: NSRange(location: i - 1, length: 1))
+    return ["*", "`", "~"].contains(a) && a == s.substring(with: NSRange(location: i, length: 1))
+}
+
+/// The chat bar's field editor: pairs markdown markers as they're typed (see autoPair).
+final class PairingEditor: NSTextView {
+    override func insertText(_ string: Any, replacementRange: NSRange) {
+        let typed = (string as? String) ?? (string as? NSAttributedString)?.string ?? "", at = selectedRange()
+        guard replacementRange.location == NSNotFound, at.length == 0, let add = autoPair(self.string, at: at.location, typed: typed) else {
+            return super.insertText(string, replacementRange: replacementRange)
+        }
+        if !add.isEmpty { super.insertText(add, replacementRange: replacementRange) }
+        setSelectedRange(NSRange(location: at.location + 1, length: 0))  // between the pair, or past the closer
+    }
+}
+
 /// "/friend [list|add|remove]* [username]": one placeholder per parameter, written like the README; * = required.
 func usage(_ c: (name: String, args: [String], help: String)) -> String {
     ([c.name] + c.args.map(placeholder)).joined(separator: " ")
@@ -417,11 +473,11 @@ func paramGuide(_ text: String, _ c: Ctx = Ctx()) -> (label: String, focus: Stri
 func roomGuide(_ rest: String, _ c: Ctx) -> (label: String, focus: String, help: String) {
     let w = rest.split(separator: " ", omittingEmptySubsequences: false).map(String.init)  // the last word is being typed
     let first = w[0].lowercased(), here = "#" + c.room
-    let createLabel = "/room create [room name]* [desc] [type]", setLabel = "/room [room name] set [name|desc|password|type]* [new]*"
+    let createLabel = "/room create [room name]* [type] [desc]", setLabel = "/room [room name] set [name|desc|password|type]* [new]*"
     if w.count == 1 {  // an option, or the room to change
-        guard !first.isEmpty, !["create", "set", "members"].contains(where: { $0.hasPrefix(first) }) else {
-            return c.room == "public" ? ("/room [create|members]*", "[create|members]", "make a room, or see who's in #public")
-                : ("/room [create|set|members]*", "[create|set|members]", "make a room, change \(here) (or a room you name first), or see who's in it")
+        guard !first.isEmpty, !["create", "set", "member"].contains(where: { $0.hasPrefix(first) }) else {
+            return c.room == "public" ? ("/room [create|member]*", "[create|member]", "make a room, or see who's in #public")
+                : ("/room [create|set|member]*", "[create|set|member]", "make a room, change \(here) (or a room you name first), or manage its members")
         }
         let r = first == "current" ? c.room : clean(first, lower: true)
         return (setLabel, "[room name]", c.joined.contains(r) && r != "public" ? "then set, to change #\(r)" : "a room you're in, or current for \(here)")
@@ -432,12 +488,32 @@ func roomGuide(_ rest: String, _ c: Ctx) -> (label: String, focus: String, help:
             return (createLabel, "[room name]", reservedRooms.contains(name) ? "\(r) can't be a room name"
                     : c.open[name] != nil ? "\(r) already exists: /join it instead" : "name the new room (one word)")
         }
-        if let k = Int(w.last!), typeNames.indices.contains(k) {
-            return (createLabel, "[type]", "\(k): \(typeNames[k])" + (k == 1 || k == 2 ? " · you'll set the password next" : ""))
+        let type = Int(w[2]).flatMap { typeNames.indices.contains($0) ? $0 : nil }
+        if w.count == 3, type != nil || w[2].isEmpty {
+            return (createLabel, "[type]", type.map { "\($0): \(typeNames[$0])" + ($0 == 1 || $0 == 2 ? " · you'll set the password next" : "") }
+                    ?? "optional: who can get in (default 0), then a description")
         }
-        return (createLabel, "[desc]", "optional: what \(r) is about, for /browse · end with a type: \(typeList)")
+        return (createLabel, "[desc]", "optional: what \(r) is about, for /browse" + (type == nil ? " · type 0, invite only" : ""))
     }
-    if first == "members" { return ("/room members", "", "who's in \(here)") }
+    if first == "member" {  // [list|kick|ban] [username], in the room you're in
+        let label = "/room member [list|kick|ban]* [username]*", act = w[1].lowercased()
+        let boss = c.room != "public" && !c.owner.isEmpty && c.owner == c.me
+        if w.count == 2 {
+            return (label, "[list|kick|ban]", boss ? "list who's in \(here), or kick or ban someone"
+                    : "list who's in \(here)" + (c.owner.isEmpty || c.room == "public" ? "" : " · \(c.owner) made it and can kick or ban"))
+        }
+        switch act {
+        case "list": return (label, "", "who's in \(here)")
+        case "kick", "ban":
+            guard c.room != "public" else { return (label, "[list|kick|ban]", "#public has no kick or ban") }
+            guard boss else { return (label, "[username]", "only \(here)'s creator can \(act)") }
+            let n = clean(w[2])
+            if act == "ban", c.bans.contains(n) { return (label, "[username]", "lifts \(n)'s ban on \(here)") }
+            let out = act == "kick" ? "" : " and keeps them out"
+            return (label, "[username]", n.isEmpty ? "who to remove from \(here)" + out : "removes \(n) from \(here)" + out)
+        default: return (label, "[list|kick|ban]", "list, kick or ban")
+        }
+    }
     let s = first == "set" ? 0 : 1, r = s == 0 || first == "current" ? c.room : clean(first, lower: true)  // where set is
     if w.count == 2, s == 1 { return (setLabel, "", "set, to change #\(r)") }
     guard w[s].lowercased() == "set" else { return (setLabel, "", "set goes after the room name") }
@@ -473,6 +549,7 @@ struct Ctx {
     var descs: [String: String] = [:]                      // room -> description
     var types: [String: Int] = [:]                         // room -> who can get in (see typeNames)
     var asks: [String: [Suggestion]] = [:]                 // questions Psst asked (a menu's title -> its answers)
+    var owner = "", bans: [String] = []                    // this room's creator (who can kick and ban) and who is banned
 }
 
 /// What you can do to someone, after picking them from a list.
@@ -484,6 +561,10 @@ func actions(_ n: String, _ c: Ctx) -> [Suggestion] {
     if c.room != "public", c.roster.contains(n), !c.members.contains(n) {
         a.append(Suggestion(label: "invite to #\(c.room)", replace: "/invite \(n)", run: true))
     }
+    if c.room != "public", !c.owner.isEmpty, c.owner == c.me, c.members.contains(n) {
+        a.append(Suggestion(label: "kick from #\(c.room)", replace: "/room member kick \(n)", run: true))
+        a.append(Suggestion(label: "ban from #\(c.room)", replace: "/room member ban \(n)", run: true))
+    }
     a.append(Suggestion(label: c.blocked.contains(n) ? "unblock" : "block", replace: "/block \(n)", run: true))
     a.append(Suggestion(label: "compare key code", replace: "/key \(n)", run: true))
     return a
@@ -492,8 +573,9 @@ func actions(_ n: String, _ c: Ctx) -> [Suggestion] {
 /// Commands that, sent bare, open their list as a menu to pick from. The value is the typed text that lists it.
 func listMenu(_ s: String) -> String? {
     let c = s.lowercased().split(separator: " ").joined(separator: " ")
-    let lists = ["/status", "/room", "/browse", "/join", "/request", "/invite", "/block", "/friend list", "/friend add", "/friend remove"]
-    return c == "/friend" ? "/friend list " : lists.contains(c) ? c + " " : nil
+    let lists = ["/status", "/room", "/browse", "/join", "/request", "/invite", "/block", "/friend list", "/friend add", "/friend remove",
+                 "/room member list", "/room member kick", "/room member ban"]
+    return c == "/friend" ? "/friend list " : c == "/room member" ? "/room member list " : lists.contains(c) ? c + " " : nil
 }
 
 /// An open menu's rows, rebuilt from what's known now: the command's list, then each picked row's menu in turn.
@@ -535,15 +617,30 @@ func suggest(_ text: String, _ c: Ctx) -> [Suggestion] {
         let others = c.roster.filter { $0 != c.me }
         switch (cmd.name, words.count) {
         case ("/status", 1): return people(c.roster.filter(c.friends.contains) + c.roster.filter { !c.friends.contains($0) })
-        case ("/room", 1):  // an option, or a room you're in to change
+        case ("/room", 1):  // an option, a room you're in to change, then the other rooms on the network, as in /browse
             var options = [("create", "make a room")]
             if c.room != "public" {  // in public: nothing to edit offered
                 options += [("set", "change #\(c.room)")] + c.joined.filter { $0 != "public" && $0 != c.room }.map { ($0, "change #\($0)") }
             }
+            let listed = Set(options.map(\.0) + [c.room])
             return options.filter { fits($0.0) }.map { Suggestion(label: $0.0, detail: $0.1, replace: base + $0.0 + ($0.0 == "create" || $0.0 == "set" ? " " : " set ")) }
-                + (fits("members") ? [Suggestion(label: "members", detail: "who's in #\(c.room)", replace: base, sub: suggest(base + "members ", c))] : [])
-        case ("/room", 2) where words[0].lowercased() == "members": return people(c.members, inRoom: true)
-        case ("/room", _) where words[0].lowercased() != "create":  // [room name] set [name|desc|password|type] [new]
+                + (fits("member") ? [Suggestion(label: "member", detail: c.room != "public" && c.owner == c.me ? "list, kick or ban people in #\(c.room)" : "who's in #\(c.room)",
+                                                replace: base + "member ")] : [])
+                + suggest("/browse " + token, c).filter { !listed.contains(String($0.label.dropFirst())) }
+        case ("/room", 3) where words[0].lowercased() == "create":  // the type: Enter makes the room, Tab goes on to a description
+            return typeNames.indices.filter { fits(String($0)) }
+                .map { Suggestion(label: "\($0)", detail: typeNames[$0] + ($0 == 0 ? " · default" : ""), replace: base + "\($0)", run: true) }
+        case ("/room", 2) where words[0].lowercased() == "member":  // kick and ban: only for the room's creator
+            return plain(["list"] + (c.room != "public" && !c.owner.isEmpty && c.owner == c.me ? ["kick ", "ban "] : []))
+        case ("/room", 3) where words[0].lowercased() == "member":
+            switch words[1].lowercased() {
+            case "list": return people(c.members, inRoom: true)
+            case "kick": return plain(c.members.filter { $0 != c.me })
+            case "ban": return plain(c.members.filter { $0 != c.me && !c.bans.contains($0) })
+                + c.bans.filter(fits).map { Suggestion(label: $0, detail: "banned · lift", replace: base + $0, run: true) }
+            default: return []
+            }
+        case ("/room", _) where words[0].lowercased() != "create" && words[0].lowercased() != "member":  // [room name] set [name|desc|password|type] [new]
             let s = words[0].lowercased() == "set" ? 0 : 1, r = s == 0 || words[0].lowercased() == "current" ? c.room : clean(words[0], lower: true)
             let type = c.types[r] ?? 0, set = words[s].lowercased() == "set"
             switch words.count - s {
@@ -707,6 +804,7 @@ final class Server {
     var passwords: [String: String] = [:]  // room -> password hash; anyone who has it can join
     var descs: [String: String] = [:]      // room -> description, shown when browsing
     var types: [String: Int] = [:]         // room -> who can get in (see typeNames); none: 0, invite only
+    var bans: [String: Set<String>] = [:]  // room -> names its creator banned; they can't get back in
     var tried: [Int: Double] = [:]         // client -> last wrong password; one guess every 3 s
     var history: [Msg] = []
     var retention: Double
@@ -797,6 +895,7 @@ final class Server {
         passwords[room] = nil
         descs[room] = nil
         types[room] = nil
+        bans[room] = nil
         invites[room] = nil
         requests[room] = nil
         restore[room] = nil
@@ -888,6 +987,7 @@ final class Server {
         case "request":
             guard owners[room] != nil else { return note("no room #\(room)") }
             guard !c.rooms.contains(room) else { return note("you're already in #\(room)") }
+            guard bans[room]?.contains(c.name) != true else { return note("you're banned from #\(room)") }
             if types[room] == 1 { return note("#\(room) takes a password, not requests: /join \(room) [password]") }
             if types[room] == 3 || invites[room]?.contains(id) == true { return enter(id, room) }
             let now = Date().timeIntervalSince1970, wait = 60 - (now - (lastAsk[c.name] ?? 0))
@@ -925,6 +1025,7 @@ final class Server {
             let name = clean(m.text ?? "")
             guard room != "public", c.rooms.contains(room) else { return note("make a room first: /room create [room name]") }
             guard types[room] != 1 else { return note("#\(room) is password only: share the password, or /room set type 2", room) }
+            guard bans[room]?.contains(name) != true else { return note("\(name) is banned from #\(room): /room member ban \(name) lifts it", room) }
             guard let target = clients.first(where: { $0.value.ready && $0.value.name == name && !$0.value.hidden })
             else { return note("no one named \(name)") }  // invisible people can't be found by name either
             guard !target.value.rooms.contains(room) else { return note("\(name) is already here", room) }
@@ -935,13 +1036,29 @@ final class Server {
         case "leave":
             guard room != "public", c.rooms.contains(room) else { return }
             if owners[room] == id { return close(room) }
-            c.rooms.remove(room)
-            c.nicks[room] = nil
-            clients[id] = c
-            c.send(Msg(t: "left", room: room))
-            send(Msg(t: "note", room: room, text: "\(c.name) left"), to: room)
-            members(room)
-            roomList()
+            remove(id, from: room, note: "\(c.name) left")
+
+        case "kick", "ban":  // the room's creator only; a ban also keeps them out, and banning again lifts it
+            let name = clean(m.text ?? ""), did = m.t == "ban" ? "banned" : "removed"
+            guard room != "public", c.rooms.contains(room) else { return note("/join the room first") }
+            guard owners[room] == id else { return note("only the room's creator can \(m.t) people", room) }
+            guard !name.isEmpty, name != c.name else { return note(name.isEmpty ? "/room member \(m.t) [username]" : "you can't \(m.t) yourself", room) }
+            let target = clients.first { $0.value.name == name }?.key
+            if m.t == "ban" {
+                if bans[room]?.remove(name) != nil {
+                    members(room)
+                    return send(Msg(t: "note", room: room, text: "\(c.name) lifted \(name)'s ban"), to: room)
+                }
+                bans[room, default: []].insert(name)
+                if let t = target { invites[room]?.remove(t); requests[room]?.removeAll { $0 == t } }
+            }
+            guard let t = target, clients[t]?.rooms.contains(room) == true else {
+                guard m.t == "ban" else { return note("\(name) isn't in #\(room)", room) }
+                members(room)
+                return send(Msg(t: "note", room: room, text: "\(c.name) banned \(name)"), to: room)
+            }
+            clients[t]?.send(Msg(t: "note", room: room, text: "\(c.name) \(did) you from #\(room)"))
+            remove(t, from: room, note: "\(c.name) \(did) \(name)")
 
         case "history":
             if c.rooms.contains(room) { replay(room, to: c) }
@@ -952,7 +1069,7 @@ final class Server {
             guard !new.isEmpty, !reservedRooms.contains(new) else { return note(new.isEmpty ? "/room set name [new]" : "#\(new) can't be a room name", room) }
             guard owners[new] == nil else { return note("#\(new) is taken", room) }
             func move<T>(_ d: inout [String: T]) { if let v = d.removeValue(forKey: room) { d[new] = v } }
-            move(&owners); move(&passwords); move(&descs); move(&types); move(&invites); move(&requests); move(&restore)
+            move(&owners); move(&passwords); move(&descs); move(&types); move(&bans); move(&invites); move(&requests); move(&restore)
             history.removeAll { $0.room == room }  // sealed to the old name: they'd no longer open
             var told = (invites[new] ?? []).union(requests[new] ?? [])
             for (cid, var o) in clients where o.rooms.remove(room) != nil {
@@ -993,9 +1110,10 @@ final class Server {
         }
     }
 
-    /// Puts a client in a room (invited, rejoining, or let in after asking).
+    /// Puts a client in a room (invited, rejoining, or let in after asking). Not someone banned from it.
     func enter(_ id: Int, _ room: String) {
         guard var c = clients[id] else { return }
+        guard bans[room]?.contains(c.name) != true else { return c.send(Msg(t: "note", text: "you're banned from #\(room)")) }
         invites[room]?.remove(id)
         requests[room]?.removeAll { $0 == id }
         if c.rooms.insert(room).inserted {
@@ -1033,6 +1151,7 @@ final class Server {
             r.pass = passwords[room]
             r.desc = descs[room]
             r.type = types[room]
+            r.bans = bans[room]?.sorted()
             if let o = clients[owner] { r.owner = o.name }
             for c in clients.values where c.rooms.contains(room) && !c.key.isEmpty {
                 r.members[c.name] = c.key
@@ -1062,6 +1181,7 @@ final class Server {
         for (room, r) in restore where owners[room] == nil {
             owners[room] = -1; passwords[room] = r.pass; descs[room] = r.desc
             types[room] = r.type ?? (r.pass == nil ? 0 : 2)  // from an older host: a password meant type 2
+            bans[room] = r.bans.map(Set.init)
         }
         tookOver = now
         roomList()
@@ -1116,10 +1236,22 @@ final class Server {
     }
 
     /// Tells a private room's members who is in it and their keys, so they can encrypt to each other.
+    /// Who's in a room, with keys and nicknames; also its creator and who is banned, for /room member.
     func members(_ room: String) {
         let inRoom = clients.values.filter { $0.rooms.contains(room) && !$0.key.isEmpty }
-        send(Msg(t: "members", room: room, keys: Dictionary(inRoom.map { ($0.name, $0.key) }, uniquingKeysWith: { a, _ in a }),
+        send(Msg(t: "members", room: room, from: owners[room].flatMap { clients[$0]?.name }, names: bans[room]?.sorted(), keys: Dictionary(inRoom.map { ($0.name, $0.key) }, uniquingKeysWith: { a, _ in a }),
                  nicks: Dictionary(inRoom.compactMap { c in c.nicks[room].map { (c.name, $0) } }, uniquingKeysWith: { a, _ in a })), to: room)
+    }
+
+    /// Takes someone out of a room: they left, or were kicked or banned.
+    func remove(_ id: Int, from room: String, note text: String) {
+        guard var c = clients[id], c.rooms.remove(room) != nil else { return }
+        c.nicks[room] = nil
+        clients[id] = c
+        c.send(Msg(t: "left", room: room))
+        send(Msg(t: "note", room: room, text: text), to: room)
+        members(room)
+        roomList()
     }
 
     func purge() {
@@ -1256,6 +1388,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     var roomDescs: [String: String] = [:]    // room -> description
     var roomTypes: [String: Int] = [:]       // room -> who can get in (see typeNames)
     var asks: [String: [Suggestion]] = [:]   // questions asked as a menu: title -> answers
+    var roomOwner: [String: String] = [:]    // room -> its creator
+    var roomBans: [String: [String]] = [:]   // room -> who its creator banned
     var pics: [String: String] = [:]        // name -> profile picture (see validPic)
     let picPreview = NSImageView()
     var requests: [String: [String]] = [:]   // room -> people asking to join, latest last
@@ -1572,7 +1706,15 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
 
     func windowDidResignKey(_ n: Notification) { if (n.object as? Panel) === input { hideInput() } }
 
+    lazy var pairing: PairingEditor = { let e = PairingEditor(); e.isFieldEditor = true; return e }()
+    func windowWillReturnFieldEditor(_ sender: NSWindow, to client: Any?) -> Any? { (client as? NSTextField) === field ? pairing : nil }
+
     func controlTextDidChange(_ n: Notification) {
+        if menu != nil, field.stringValue.hasPrefix("/") { menu = nil }  // a new command gets its own guide, not an old menu behind it
+        if let q = quoteDesc(field.stringValue) {
+            field.stringValue = q.text
+            field.currentEditor()?.selectedRange = NSRange(location: q.cursor, length: 0)
+        }
         pick = 0
         updateHints()
     }
@@ -1588,6 +1730,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
             updateHints()
         case #selector(NSResponder.insertTab(_:)) where open:
             if row!.sub != nil { pickInto(row!) } else { accept() }
+        case #selector(NSResponder.deleteBackward(_:)) where textView.selectedRange().length == 0 && emptyPair(text, at: textView.selectedRange().location):
+            let both = NSRange(location: textView.selectedRange().location - 1, length: 2)
+            if textView.shouldChangeText(in: both, replacementString: "") { textView.replaceCharacters(in: both, with: ""); textView.didChangeText() }
         case #selector(NSResponder.insertNewline(_:)) where NSApp.currentEvent?.modifierFlags.contains(.shift) == true:
             textView.insertNewlineIgnoringFieldEditor(nil)  // Shift+Enter: a new line in the message
         case #selector(NSResponder.insertNewline(_:)):
@@ -1636,7 +1781,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         Ctx(me: me, room: room, roster: roster, friends: friends, blocked: blocked, changed: changed.keys.sorted(),
             joined: ["public"] + rooms.subtracting(["public"]).sorted(), invited: invited.sorted(), open: openRooms,
             members: room == "public" ? roster : (members[room] ?? [:]).keys.sorted(), nicks: nicks[room] ?? [:],
-            requests: requests[room] ?? [], locked: locked.sorted(), descs: roomDescs, types: roomTypes, asks: asks)
+            requests: requests[room] ?? [], locked: locked.sorted(), descs: roomDescs, types: roomTypes, asks: asks,
+            owner: roomOwner[room] ?? "", bans: roomBans[room] ?? [])
     }
 
     func updateHints() {
@@ -1752,17 +1898,22 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         }
         guard let line, !me.isEmpty else { return note("not connected yet: looking for other Macs running Psst") }
         switch parts[0] {
-        case "/room":  // create [room name] [desc] [type] · [room name] set [name|desc|password|type] [new] · members
+        case "/room":  // create [room name] [type] [desc] · [room name] set [name|desc|password|type] [new] · member [list|kick|ban] [username]
             let what = arg.split(separator: " ").first?.lowercased() ?? ""
             if what == "create" {
                 let a = createArgs(String(arg.dropFirst(6)))
-                guard !a.room.isEmpty else { return note("/room create [room name] [desc] [type]") }
+                guard !a.room.isEmpty else { return note("/room create [room name] [type] [desc]") }
                 guard !reservedRooms.contains(a.room) else { return note("#\(a.room) can't be a room name") }
                 return line.send(Msg(t: "create", room: a.room, descs: a.desc.isEmpty ? nil : [a.room: a.desc], types: [a.room: a.type]))
             }
-            if what == "members" || what.isEmpty { return note("#\(room): " + guide.members.joined(separator: ", ")) }
+            if what == "member" {  // list: an empty list falls through to here
+                let w = arg.split(separator: " ").dropFirst().map(String.init), act = w.first?.lowercased() ?? "list"
+                if act == "list" { return note("#\(room): " + guide.members.joined(separator: ", ")) }
+                guard act == "kick" || act == "ban", w.count > 1 else { return note("/room member [list|kick|ban] [username]") }
+                return line.send(Msg(t: act, room: room, text: w[1]))
+            }
             guard let e = roomEdit(arg, current: room) else {
-                return note("/room create [room name] · /room [room name] set [name|desc|password|type] [new] · /room members")
+                return note("/room create [room name] · /room [room name] set [name|desc|password|type] [new] · /room member [list|kick|ban] [username]")
             }
             switch e.field {
             case "name": line.send(Msg(t: "rename", room: e.room, text: clean(e.value, lower: true)))
@@ -1816,6 +1967,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         case "members":
             members[r] = m.keys ?? [:]
             nicks[r] = m.nicks ?? [:]
+            roomOwner[r] = m.from
+            roomBans[r] = m.names ?? []
             requests[r]?.removeAll { m.keys?[$0] != nil }  // let in already
             learn(m.keys ?? [:])
         case "pic": pics[from] = validPic(m.pic).isEmpty ? nil : m.pic  // checked again: any Mac can host
@@ -1906,7 +2059,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         case .direct(let a), .relay(let a):
             guard let res = hosts.first(where: { ad($0)?.id == a.id }) else { return nil }
             let params = tcp()
-            if pin {  // a Mac is often reachable over several links (school Wi-Fi, peer-to-peer); each retry pins the next,
+            if pin {  // a Mac is often reachable over several links (Wi-Fi, peer-to-peer); each retry pins the next,
                       // so a network that silently drops traffic can't trap us on it
                 let links: [NWInterface?] = [nil] + res.interfaces.filter { $0.type != .loopback }
                 params.requiredInterface = links[attempts % links.count]
@@ -2290,7 +2443,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         nameField.stringValue = name ?? ""
         nameField.isEnabled = name == nil || left == 0
         saveButton.isEnabled = nameField.isEnabled
-        nameNote.stringValue = name == nil ? "Pick the name classmates will see. After this you can change it once every 2 weeks."
+        nameNote.stringValue = name == nil ? "Pick the name others will see. After this you can change it once every 2 weeks."
             : left > 0 ? "You can change your name again in \(waitText(left))."
             : "You can change your name now, then not again for 2 weeks."
         for p in popups {
@@ -2532,14 +2685,14 @@ func selftest() {
     check(hint("/invite a", ["ana", "bob"]).map(\.replace) == ["/invite ana"], "/invite suggests people")
     check(hint("/join m", [], ["math", "public"]).map(\.replace) == ["/join math"], "/join suggests rooms")
     check(hint("/room create ma").isEmpty, "free argument has nothing to pick")
-    check(paramGuide("/room create ma")?.label == "/room create [room name]* [desc] [type]" && paramGuide("/room create ma")?.focus == "[room name]", "guide shows format")
+    check(paramGuide("/room create ma")?.label == "/room create [room name]* [type] [desc]" && paramGuide("/room create ma")?.focus == "[room name]", "guide shows format")
     check(usage(commands.first { $0.name == "/trust" }!) == "/trust [username]*" && paramGuide("/friend ")?.label == "/friend [list|add|remove]* [username]",
           "a star marks required parameters")
     let rc = Ctx(room: "art", joined: ["public", "art", "club"], open: ["art": 1, "club": 2], types: ["club": 2])
     let g = { (t: String) in paramGuide(t, rc).map { "\($0.label) | \($0.focus) | \($0.help)" } ?? "nil" }
-    check(g("/room ") == "/room [create|set|members]* | [create|set|members] | make a room, change #art (or a room you name first), or see who's in it"
-          && suggest("/room ", rc).map(\.replace) == ["/room create ", "/room set ", "/room club set ", "/room "]
-          && suggest("/room cl", rc).map(\.replace) == ["/room club set "] && hint("/room ").map(\.label) == ["create", "members"],
+    check(g("/room ") == "/room [create|set|member]* | [create|set|member] | make a room, change #art (or a room you name first), or manage its members"
+          && suggest("/room ", rc).map(\.replace) == ["/room create ", "/room set ", "/room club set ", "/room member "]
+          && suggest("/room cl", rc).map(\.replace) == ["/room club set "] && hint("/room ").map(\.label) == ["create", "member"],
           "/room: an option, or a room to change: \(suggest("/room ", rc).map(\.replace))")
     let set = "/room [room name] set [name|desc|password|type]* [new]*"
     check(g("/room set name lounge") == "\(set) | [new] | renames #art to #lounge"
@@ -2555,21 +2708,49 @@ func selftest() {
           && suggest("/room club set type ", rc).map { "\($0.label) \($0.detail)" } == ["0 invite only", "1 password only", "2 invite or password · now", "3 open access"]
           && suggest("/room club set type ", rc).allSatisfy(\.run) && suggest("/room set ", rc).map(\.label) == ["name", "desc", "password", "type"],
           "set: fields, then types to pick")
-    let cl = "/room create [room name]* [desc] [type]"
+    let cl = "/room create [room name]* [type] [desc]"
     check(g("/room create club") == "\(cl) | [room name] | #club already exists: /join it instead"
           && g("/room create current") == "\(cl) | [room name] | #current can't be a room name"
-          && g("/room create chess after school 1") == "\(cl) | [type] | 1: password only · you'll set the password next"
-          && g("/room create chess after") == "\(cl) | [desc] | optional: what #chess is about, for /browse · end with a type: \(typeList)",
+          && g("/room create chess ") == "\(cl) | [type] | optional: who can get in (default 0), then a description"
+          && g("/room create chess 1") == "\(cl) | [type] | 1: password only · you'll set the password next"
+          && g("/room create chess 1 after") == "\(cl) | [desc] | optional: what #chess is about, for /browse"
+          && g("/room create chess after") == "\(cl) | [desc] | optional: what #chess is about, for /browse · type 0, invite only",
           "create guide: \(g("/room create chess after"))")
-    check(suggest("/room ", Ctx(joined: ["public", "club"])).map(\.label) == ["create", "members"]
-          && paramGuide("/room ", Ctx(joined: ["public", "club"]))?.label == "/room [create|members]*", "in public: no editing offered")
+    check(suggest("/room create chess ", rc).map(\.replace) == ["/room create chess 0", "/room create chess 1", "/room create chess 2", "/room create chess 3"]
+          && suggest("/room create chess ", rc).allSatisfy(\.run) && hint("/room create chess af").isEmpty, "create: pick a type, or type a description")
+    let inPublic = Ctx(joined: ["public", "club"], open: ["club": 2, "art": 1])
+    check(suggest("/room ", inPublic).map(\.label) == ["create", "member", "#art", "#club"] && suggest("/room ", inPublic).suffix(2).map(\.replace) == ["/request art", "/join club"]
+          && suggest("/room a", inPublic).map(\.label) == ["#art"], "rooms on the network follow the options")
+    check(suggest("/room ", Ctx(joined: ["public", "club"])).map(\.label) == ["create", "member"]
+          && paramGuide("/room ", Ctx(joined: ["public", "club"]))?.label == "/room [create|member]*", "in public: no editing offered")
     check(paramGuide("/room set name x", Ctx(joined: ["public"]))?.help == "#public can't be changed: name a room you're in", "no changing #public")
-    check(createArgs("chess after school 2") == ("chess", "after school", 2) && createArgs("Chess") == ("chess", "", 0)
-          && createArgs("chess \"grade 3\"") == ("chess", "grade 3", 0) && createArgs("chess 3") == ("chess", "", 3)
-          && createArgs("chess 9") == ("chess", "9", 0), "create: a last word 0–3 is the type")
+    check(createArgs("chess 2 after school") == ("chess", "after school", 2) && createArgs("Chess") == ("chess", "", 0)
+          && createArgs("chess \"3 people\"") == ("chess", "3 people", 0) && createArgs("chess 3") == ("chess", "", 3)
+          && createArgs("chess 9 lives") == ("chess", "9 lives", 0) && createArgs("chess after school 2") == ("chess", "after school 2", 0),
+          "create: a second word 0–3 is the type")
     let ed = { (a: String) in roomEdit(a, current: "art").map { "\($0.room)|\($0.field)|\($0.value)" } ?? "nil" }
     check(ed("set name lounge") == "art|name|lounge" && ed("club set desc after school") == "club|desc|after school"
           && ed("Current set TYPE 2") == "art|type|2" && ed("club lounge") == "nil" && ed("set") == "art||", "set: room name optional, current is this room")
+    let own = Ctx(me: "me", room: "club", roster: ["me", "zoe", "al"], joined: ["public", "club"], members: ["me", "zoe"], owner: "me", bans: ["al"])
+    check(suggest("/room member ", own).map(\.replace) == ["/room member list", "/room member kick ", "/room member ban "]
+          && suggest("/room member ", rc).map(\.replace) == ["/room member list"], "member: kick and ban only for the creator")
+    check(suggest("/room member kick ", own).map(\.replace) == ["/room member kick zoe"]
+          && suggest("/room member ban ", own).map { "\($0.label)|\($0.detail)" } == ["zoe|", "al|banned · lift"], "kick: members; ban: members, then who's banned")
+    check(paramGuide("/room member kick zoe", own)?.help == "removes zoe from #club" && paramGuide("/room member ban al", own)?.help == "lifts al's ban on #club"
+          && paramGuide("/room member kick zoe", rc)?.help == "only #art's creator can kick", "member guide")
+    check(actions("zoe", own).map(\.replace) == ["/friend add zoe", "/room member kick zoe", "/room member ban zoe", "/block zoe", "/key zoe"],
+          "the creator can kick or ban from someone's menu")
+    let qd = { (t: String) in quoteDesc(t).map { "\($0.text)|\($0.cursor)" } ?? "nil" }
+    check(qd("/room create chess a") == "/room create chess \"a\"|21" && qd("/room create chess 2 a") == "/room create chess 2 \"a\"|23"
+          && qd("/room create chess 2") == "nil" && qd("/room create chess 3d") == "/room create chess \"3d\"|22" && qd("/room create chess \"a\"") == "nil"
+          && qd("/room club set desc a b") == "/room club set desc \"a b\"|24" && qd("/room set desc ") == "nil" && qd("/room create ch") == "nil",
+          "descriptions get quotes as they're typed: \(qd("/room create chess a"))")
+    check(autoPair("", at: 0, typed: "*") == "**" && autoPair("hi ", at: 3, typed: "`") == "``" && autoPair("2", at: 1, typed: "*") == nil
+          && autoPair("**", at: 1, typed: "*") == "**" && autoPair("**b**", at: 3, typed: "*") == "" && autoPair("**b*", at: 4, typed: "*") == nil
+          && autoPair("~~s~~", at: 4, typed: "~") == "" && autoPair("``", at: 1, typed: "`") == "" && autoPair("/room ", at: 6, typed: "*") == nil
+          && autoPair("word", at: 4, typed: "*") == nil && autoPair("a", at: 0, typed: "*") == nil && autoPair("", at: 0, typed: "a") == nil,
+          "markdown markers pair up at word edges")
+    check(emptyPair("**", at: 1) && emptyPair("a ``", at: 3) && !emptyPair("*a*", at: 2) && !emptyPair("*", at: 1) && !emptyPair("/x **", at: 4), "backspace empties a pair")
     check(suggest("#q?", Ctx(asks: ["#q?": [Suggestion(label: "1", replace: "x", run: true)]])).map(\.replace) == ["x"], "a question's answers")
     check(unquote(" \"chess club\" ") == "chess club" && unquote("“quiet”") == "quiet" && unquote("plain words") == "plain words", "quotes optional")
     check(paramGuide("/friend a")?.focus == "[list|add|remove]", "guide highlights first parameter")
@@ -2595,9 +2776,9 @@ func selftest() {
     check(acts.map(\.replace) == ["/friend add al", "/invite al", "/block al", "/key al"] && acts.allSatisfy(\.run), "picking someone shows actions")
     check(suggest("/friend list ", cx).first?.sub?.first?.replace == "/friend remove bo", "friend list: pick, then remove")
     check(suggest("/friend list bo ", cx).isEmpty && suggest("/status al ", cx).isEmpty, "actions never go in the typed text")
-    check(!(suggest("/room members ", cx).last?.sub ?? []).contains { $0.label.hasPrefix("invite") }, "no invite for people already here")
-    check(suggest("/room members ", cx).map(\.label) == ["me", "Z · zoe"] && suggest("/room ", cx).last?.sub?.map(\.label) == ["me", "Z · zoe"]
-          && menuRows("/room ", ["members", "Z · zoe"], cx).depth == 2, "members: nicknames, a menu inside /room")
+    check(!(suggest("/room member list ", cx).last?.sub ?? []).contains { $0.label.hasPrefix("invite") }, "no invite for people already here")
+    check(suggest("/room member list ", cx).map(\.label) == ["me", "Z · zoe"] && listMenu("/room member") == "/room member list "
+          && menuRows("/room member list ", ["Z · zoe"], cx).depth == 1, "member list: nicknames, then what to do")
     check(suggest("/browse ", cx).map(\.replace) == ["/request art", "/join band", "/join club"] && suggest("/browse ", cx).allSatisfy(\.run),
           "rooms: ask, or join when invited or already in")
     check(suggest("/accept ", cx).map(\.replace) == ["/accept bo", "/accept al", "/accept all"], "accept: latest first, then all")
@@ -2769,6 +2950,22 @@ func selftest() {
     check(ty.owners["pw"] != nil, "can't rename to a reserved word")
     ty.handle(3, Msg(t: "rename", room: "pw", text: "hall"))
     check(ty.types["hall"] == 3 && ty.snapshot().rooms["hall"]?.type == 3, "rename keeps the type; the next host gets it")
+    ty.handle(3, Msg(t: "kick", room: "hall", text: "ana"))
+    check(inT(1, "hall"), "only the creator kicks")
+    ty.handle(1, Msg(t: "kick", room: "hall", text: "cy"))
+    check(!inT(3, "hall") && tin[3]?.contains { $0.t == "left" && $0.room == "hall" } == true, "kick takes them out")
+    ty.handle(3, Msg(t: "join", room: "hall"))
+    check(inT(3, "hall"), "kicked, not banned: an open room lets them back")
+    ty.handle(1, Msg(t: "ban", room: "hall", text: "cy"))
+    ty.handle(3, Msg(t: "join", room: "hall"))
+    let told = tin[1]?.last(where: { $0.t == "members" })
+    check(!inT(3, "hall") && ty.bans["hall"] == ["cy"] && told?.names == ["cy"] && told?.from == "ana" && ty.snapshot().rooms["hall"]?.bans == ["cy"],
+          "banned: kept out; members see the ban and the creator; the next host keeps it")
+    ty.handle(1, Msg(t: "invite", room: "hall", text: "cy"))
+    check(ty.invites["hall"]?.isEmpty != false, "can't invite someone banned")
+    ty.handle(1, Msg(t: "ban", room: "hall", text: "cy"))
+    ty.handle(3, Msg(t: "join", room: "hall"))
+    check(inT(3, "hall") && ty.bans["hall"]?.isEmpty == true, "banning again lifts it")
 
     // End-to-end encryption
     let A = Identity(), B = Identity(), C = Identity()

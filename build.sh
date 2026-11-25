@@ -29,7 +29,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
   <key>LSUIElement</key><true/>
-  <key>NSLocalNetworkUsageDescription</key><string>Psst finds classmates running Psst on this network.</string>
+  <key>NSLocalNetworkUsageDescription</key><string>Psst finds other Macs running Psst on this network.</string>
   <key>NSBonjourServices</key><array><string>_psst._tcp</string></array>
 </dict></plist>
 EOF
