@@ -9,7 +9,7 @@ Chat overlay for Macs on the same local network. No accounts, no central server.
 3. On first launch, right-click `Psst.app` and choose **Open** (the app is not notarized), then **allow local network access**. If it does not open, System Settings > Privacy & Security > Open Anyways (scroll down).
 4. Choose a username. It can be changed every two weeks.
 
-Psst updates itself daily by default. The interval can be changed or updates turned off in Settings.
+Psst updates itself daily by default. The interval can be changed or updates turned off in Settings. Psst checks on launch; Settings > General shows when an update is available, with **Check Now** and **Update Now**.
 
 ## Usage
 
@@ -26,6 +26,8 @@ Psst updates itself daily by default. The interval can be changed or updates tur
 - Macs running Psst find each other automatically, over the network or directly over Wi-Fi. Macs out of range connect through nearby ones.
 - One Mac hosts. If it quits, the next one takes over with rooms and recent messages intact.
 - Messages fade after a few seconds. `/history on` keeps them.
+- Swearing and NSFW words are hidden in messages by default and not allowed in usernames.
+- Typing indicators, mention sounds, pings and which side messages appear on can be changed in Settings.
 - Drag a message to move the overlay. Right-click to lock its position.
 
 ## Privacy

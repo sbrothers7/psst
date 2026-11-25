@@ -12,7 +12,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp Psst.icns "$APP/Contents/Resources/"
 
 for arch in arm64 x86_64; do
-  swiftc -O -swift-version 5 -target "$arch-apple-macos12" main.swift -o "$TMP/psst-$arch"
+  swiftc -O -swift-version 5 -target "$arch-apple-macos12" Sources/*.swift -o "$TMP/psst-$arch"
 done
 lipo -create "$TMP/psst-arm64" "$TMP/psst-x86_64" -output "$APP/Contents/MacOS/Psst"
 rm -rf "$TMP"
