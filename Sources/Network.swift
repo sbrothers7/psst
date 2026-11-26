@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Network
 
@@ -22,11 +23,60 @@ func tcp() -> NWParameters {
 }
 
 /// True when every other Mac is found only over peer-to-peer Wi-Fi (awdl/llw links), never over the network:
-/// the network keeps Macs apart (client isolation, or a VPN that captures local traffic), so Psst reaches only
-/// Macs within ~30 m. `links`: interface names each other Mac was found on. No other Mac found: can't tell, false.
+/// the network keeps Macs apart (client isolation, or a VPN that captures local traffic), so Psst reaches Macs
+/// within ~30 m, and others through them. `links`: interface names each other Mac was found on. No other Mac found: can't tell, false.
 // ponytail: a VPN that passes Bonjour but drops the connections themselves goes unnoticed.
 func onlyWiFi(_ links: [[String]]) -> Bool {
     !links.isEmpty && links.allSatisfy { $0.allSatisfy { $0.hasPrefix("awdl") || $0.hasPrefix("llw") } }
+}
+
+// MARK: - Network addresses: for networks that drop Bonjour but still let Macs connect
+//
+// Each Mac tells the host its addresses; the host passes on its own and the next two in line's (see shareAddrs),
+// and each Mac remembers them and asks each one on its own network which host it's on (see probePeers), as
+// Bonjour would have told it.
+
+typealias Net = (addr: UInt32, mask: UInt32)
+
+/// This Mac's IPv4 addresses and netmasks on Wi-Fi and Ethernet (en*): not loopback, VPN, peer-to-peer or self-assigned.
+// ponytail: IPv4 only; add IPv6 if a network turns out to be IPv6-only.
+func localNets() -> [Net] {
+    var list: UnsafeMutablePointer<ifaddrs>?
+    guard getifaddrs(&list) == 0, let start = list else { return [] }
+    defer { freeifaddrs(start) }
+    func v4(_ s: UnsafeMutablePointer<sockaddr>) -> UInt32 {
+        s.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { UInt32(bigEndian: $0.pointee.sin_addr.s_addr) }
+    }
+    return sequence(first: start) { $0.pointee.ifa_next }.compactMap { p in
+        let i = p.pointee, up = UInt32(IFF_UP | IFF_RUNNING)
+        guard String(cString: i.ifa_name).hasPrefix("en"), i.ifa_flags & up == up, let a = i.ifa_addr, let m = i.ifa_netmask,
+              a.pointee.sa_family == sa_family_t(AF_INET), v4(a) >> 16 != 0xA9FE else { return nil }  // 169.254: no network
+        return (v4(a), v4(m))
+    }
+}
+
+func ipv4(_ s: String) -> UInt32? {
+    let parts = s.split(separator: ".", omittingEmptySubsequences: false).map { UInt8($0) }
+    guard parts.count == 4, !parts.contains(nil) else { return nil }
+    return parts.reduce(0) { $0 << 8 | UInt32($1!) }
+}
+
+func dotted(_ ip: UInt32) -> String { [24, 16, 8, 0].map { String(ip >> $0 & 255) }.joined(separator: ".") }
+
+/// Of `addrs`, the ones on a network this Mac is on, other than its own: worth asking directly.
+/// Other networks are skipped, so addresses remembered at school aren't tried at home.
+func onMyNetworks(_ addrs: [String], _ nets: [Net]) -> [String] {
+    addrs.compactMap(ipv4).filter { ip in
+        !nets.contains { $0.addr == ip } && nets.contains { $0.addr & $0.mask == ip & $0.mask }
+    }.map(dotted)
+}
+
+/// A HostAd from a Bonjour TXT record, or the same fields sent over a direct connection ("ad", from `addr`).
+/// nil for an older Psst: it can't talk to this one (see wireVersion).
+func hostAd(_ t: [String: String], addr: String = "") -> HostAd? {
+    guard t["v"] == wireVersion, let id = t["id"], let since = t["since"].flatMap(Double.init) else { return nil }
+    return HostAd(id: id, since: since, up: t["up"] ?? "", upSince: t["upsince"].flatMap(Double.init) ?? .infinity,
+                  hops: t["hops"].flatMap(Int.init) ?? maxHops, addr: addr)
 }
 
 // MARK: - Hosting: every Mac hosts, everyone shares the oldest
@@ -38,7 +88,8 @@ func onlyWiFi(_ links: [[String]]) -> Bool {
 
 /// A Mac as seen over Bonjour. `since` = when its host started. `up` = the host it is connected to right now
 /// (maybe one this Mac can't see) and `hops` how many Macs away that is: 0 = itself, 1 = direct.
-struct HostAd: Equatable { var id: String, since: Double, up = "", upSince = Double.infinity, hops = 0 }
+/// `addr`: the network address it answered on, when found by asking instead of over Bonjour.
+struct HostAd: Equatable { var id: String, since: Double, up = "", upSince = Double.infinity, hops = 0, addr = "" }
 
 let maxHops = 3
 
@@ -103,15 +154,33 @@ struct Msg: Codable {
     var pic: String? = nil            // hello/nick/pic: profile picture: "letters", a base64 JPEG or PNG, "" for none
     var types: [String: Int]? = nil   // rooms/create: room -> who can get in (see typeNames)
     var tag: String? = nil            // hello/nick: my permanent 4-digit tag; the host shows me as name#tag
+    var addrs: [String]? = nil        // hello: my network addresses; addrs: where the next host can be (see shareAddrs)
+    var ad: [String: String]? = nil   // ad: a host's advert (see Server.advertise), asked for directly
 }
 
-// MARK: - Wire: newline-delimited JSON over one TCP connection
+// MARK: - Wire: one TCP connection, encrypted
+//
+// Each side's first line is a fresh Curve25519 public key; every line after is one JSON Msg sealed with ChaChaPoly,
+// in base64. Someone watching the network sees which Macs talk, never what they say: names, messages, addresses.
+// Nothing proves who is at the other end (private rooms check that themselves), so someone sitting in the middle
+// of a connection and passing it on could still read it. Psst before this can't talk to it (see wireVersion).
+
+let wireVersion = "2"  // in every advert; Macs without it speak plain JSON and are left out of the election
+
+/// Both ends of a Line derive the same key from the two public keys; anyone else gets a different one.
+func lineKey(_ mine: Curve25519.KeyAgreement.PrivateKey, _ theirs: Curve25519.KeyAgreement.PublicKey) -> SymmetricKey? {
+    guard let shared = try? mine.sharedSecretFromKeyAgreement(with: theirs) else { return nil }
+    let pubs = [mine.publicKey.rawRepresentation, theirs.rawRepresentation].sorted { $0.lexicographicallyPrecedes($1) }
+    return shared.hkdfDerivedSymmetricKey(using: SHA256.self, salt: Data("psst line".utf8), sharedInfo: pubs[0] + pubs[1], outputByteCount: 32)
+}
 
 final class Line {
     let conn: NWConnection
     var onMsg: (Msg) -> Void = { _ in }
     var onClose: () -> Void = {}
-    private var buf = Data(), closed = false
+    private var buf = Data(), closed = false, dead = false
+    private let mine = Curve25519.KeyAgreement.PrivateKey()
+    private var key: SymmetricKey?, queued: [Msg] = []  // sent before the other side's key arrived
 
     init(_ conn: NWConnection) { self.conn = conn }
 
@@ -124,16 +193,23 @@ final class Line {
             }
         }
         conn.start(queue: .main)
+        write(Data(mine.publicKey.rawRepresentation.base64EncodedString().utf8))
         read()
     }
 
     func send(_ m: Msg) {
-        guard !closed, var data = try? JSONEncoder().encode(m) else { return }
-        data.append(10)
-        conn.send(content: data, completion: .idempotent)
+        guard !closed, !dead else { return }
+        guard let key else { return queued.append(m) }
+        guard let json = try? JSONEncoder().encode(m), let box = try? ChaChaPoly.seal(json, using: key).combined else { return }
+        write(Data(box.base64EncodedString().utf8))
     }
 
-    func close() { conn.cancel() }
+    func close() {
+        dead = true  // nothing more in or out
+        conn.cancel()
+    }
+
+    private func write(_ line: Data) { conn.send(content: line + [10], completion: .idempotent) }
 
     private func finish() {
         guard !closed else { return }
@@ -141,16 +217,32 @@ final class Line {
         onClose()
     }
 
+    /// The other side's first line is its key; each line after is one sealed message. Anything else ends the line.
+    private func got(_ line: Data) {
+        guard let raw = Data(base64Encoded: line) else { return close() }
+        guard let key else {
+            guard let theirs = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: raw), let k = lineKey(mine, theirs) else { return close() }
+            self.key = k
+            let waiting = queued
+            queued = []
+            waiting.forEach(send)
+            return
+        }
+        guard let box = try? ChaChaPoly.SealedBox(combined: raw), let json = try? ChaChaPoly.open(box, using: key) else { return close() }
+        if let m = try? JSONDecoder().decode(Msg.self, from: json) { onMsg(m) }
+    }
+
     private func read() {
         conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, done, error in
             guard let self, !self.closed else { return }
             if let data { self.buf.append(data) }
-            while let i = self.buf.firstIndex(of: 10) {
-                let line = self.buf[self.buf.startIndex..<i]
+            while !self.dead, let i = self.buf.firstIndex(of: 10) {
+                let line = Data(self.buf[self.buf.startIndex..<i])
                 self.buf = Data(self.buf[(i + 1)...])
-                if let m = try? JSONDecoder().decode(Msg.self, from: line) { self.onMsg(m) }
+                self.got(line)
             }
-            if done || error != nil || self.buf.count > maxLine { self.close() } else { self.read() }
+            // a sealed line is base64 of a JSON line of up to maxLine, plus nonce and tag
+            if done || error != nil || self.dead || self.buf.count > maxLine * 4 / 3 + 64 { self.close() } else { self.read() }
         }
     }
 }

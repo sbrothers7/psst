@@ -610,8 +610,68 @@ func selftest() {
         return got
     }
     let ping = "ping 👍🏽 한국어 é 👨‍👩‍👧"
-    let direct = talk(testPort, [Msg(t: "hello", from: "net"), Msg(t: "say", text: ping)]) { $0.contains { $0.text == ping } }
+    let direct = talk(testPort, [Msg(t: "hello", from: "net", addrs: ["10.4.4.4"]), Msg(t: "say", text: ping)]) { $0.contains { $0.text == ping } }
     check(direct.first?.from == "net", "tcp hello")
+    check(!direct.contains { $0.addrs != nil }, "joining passes on no addresses")
+
+    // Addresses: the next two in line's, never an invisible one's, once a minute (shareAddrs runs on a timer)
+    var gotA: [Msg] = []
+    let la = Line(NWConnection(to: .hostPort(host: "127.0.0.1", port: testPort), using: .tcp))
+    let lb = Line(NWConnection(to: .hostPort(host: "127.0.0.1", port: testPort), using: .tcp))
+    la.onMsg = { gotA.append($0) }
+    la.start(); lb.start()
+    la.send(Msg(t: "hello", from: "sa", since: 1, addrs: ["10.1.2.3", "nope"]))
+    lb.send(Msg(t: "hello", from: "sb", hidden: true, since: 2, addrs: ["10.9.9.9"]))
+    RunLoop.main.run(until: Date() + 0.5)
+    let t0 = Date().timeIntervalSince1970
+    net.shareAddrs(now: t0)
+    let held = net.shared
+    net.shareAddrs(now: t0 + 59)
+    let stillHeld = net.shared
+    net.shareAddrs(now: t0 + 601)
+    RunLoop.main.run(until: Date() + 0.3)
+    la.close(); lb.close()
+    let shared = gotA.last { $0.t == "addrs" }?.addrs ?? []
+    check(!held.contains("10.1.2.3") && !stillHeld.contains("10.1.2.3"), "a new next in line's address waits a random 1–10 minutes")
+    check(net.successors.count == 2 && shared.contains("10.1.2.3") && !shared.contains("10.9.9.9") && !shared.contains("nope") && !shared.contains("10.4.4.4"),
+          "then the host passes on the next in line's addresses, not invisible people's or anyone else's")
+
+    // The wire: a key, then sealed lines only the other end can open; plain JSON (an older Psst) gets nothing
+    let rawKey = Curve25519.KeyAgreement.PrivateKey()
+    var wire = Data()
+    let sniff = try! NWListener(using: .tcp, on: 47833)
+    sniff.newConnectionHandler = { c in
+        c.start(queue: .main)
+        c.send(content: Data(rawKey.publicKey.rawRepresentation.base64EncodedString().utf8) + [10], completion: .idempotent)
+        func more() { c.receive(minimumIncompleteLength: 1, maximumLength: 65536) { d, _, done, _ in wire.append(d ?? Data()); if !done { more() } } }
+        more()
+    }
+    sniff.start(queue: .main)
+    RunLoop.main.run(until: Date() + 0.3)
+    let out = Line(NWConnection(to: .hostPort(host: "127.0.0.1", port: 47833), using: .tcp))
+    out.start()
+    out.send(Msg(t: "hello", from: "secretname"))
+    RunLoop.main.run(until: Date() + 0.5)
+    out.close(); sniff.cancel()
+    let sent = wire.split(separator: 10).map { Data(base64Encoded: Data($0)) }
+    let theirKey = sent.first.flatMap { $0.flatMap { try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: $0) } }
+    let opened = sent.count == 2 ? theirKey.flatMap { lineKey(rawKey, $0) }.flatMap { k in
+        sent[1].flatMap { try? ChaChaPoly.open(ChaChaPoly.SealedBox(combined: $0), using: k) }
+    } : nil
+    check(!String(decoding: wire, as: UTF8.self).contains("secretname") && opened.map { String(decoding: $0, as: UTF8.self).contains("secretname") } == true,
+          "on the wire: a key, then sealed lines that only the other end opens")
+    var plain = Data()
+    let old = NWConnection(to: .hostPort(host: "127.0.0.1", port: testPort), using: .tcp)
+    old.start(queue: .main)
+    old.send(content: try! JSONEncoder().encode(Msg(t: "hello", from: "oldpsst")) + [10], completion: .idempotent)
+    func more(_ c: NWConnection) { c.receive(minimumIncompleteLength: 1, maximumLength: 65536) { d, _, done, _ in plain.append(d ?? Data()); if !done { more(c) } } }
+    more(old)
+    RunLoop.main.run(until: Date() + 0.5)
+    old.cancel()
+    check(plain.split(separator: 10).count == 1 && !net.clients.values.contains { $0.name == "oldpsst" }, "an older Psst's plain JSON gets the host's key and nothing else")
+    let asked = talk(testPort, [Msg(t: "ad")]) { !$0.isEmpty }
+    check(asked.first?.ad.flatMap { hostAd($0) }?.id == net.id && net.clients.values.allSatisfy(\.ready),
+          "asked directly, a host says what its Bonjour listing would, without becoming a client")
     check(direct.contains { $0.text == ping }, "tcp say keeps unicode intact")
     let far = talk(relayPort, [Msg(t: "via", text: net.id, ts: 0), Msg(t: "hello", from: "far"), Msg(t: "say", text: "hi from afar")]) {
         $0.contains { $0.text == "hi from afar" }
@@ -644,6 +704,19 @@ func selftest() {
     check(onlyWiFi([["awdl0"], ["llw0", "awdl0"]]) && !onlyWiFi([["awdl0", "en0"], ["awdl0"]]) && !onlyWiFi([]),
           "other Macs found only over peer-to-peer Wi-Fi: the network keeps Macs apart; none found: can't tell")
     check(NWTXTRecord(["id": "x", "since": "12.5"])["since"].flatMap(Double.init) == 12.5, "host start time survives the TXT record")
+    let school: [Net] = [(ipv4("172.16.14.21")!, ipv4("255.255.252.0")!)]
+    check(onMyNetworks(["172.16.13.5", "172.16.14.21", "172.16.20.1", "10.0.0.2", "172.16.15.300", "x", "1.2.3"], school) == ["172.16.13.5"],
+          "only other Macs on this Mac's own network are asked directly")
+    check(dotted(ipv4("172.16.14.21")!) == "172.16.14.21" && !localNets().contains { $0.addr >> 24 == 127 }, "addresses round-trip; loopback isn't shared")
+    check(hostAd(["v": wireVersion, "id": "x", "since": "5", "up": "h", "upsince": "1", "hops": "2"], addr: "172.16.13.5")
+          == HostAd(id: "x", since: 5, up: "h", upSince: 1, hops: 2, addr: "172.16.13.5") && hostAd(["v": wireVersion, "since": "5"]) == nil,
+          "host advert from a TXT record or a direct answer")
+    check(hostAd(["id": "x", "since": "5"]) == nil, "an older Psst, which can't read encrypted lines, is left out of the election")
+    let ka = Curve25519.KeyAgreement.PrivateKey(), kb = Curve25519.KeyAgreement.PrivateKey()
+    func bytes(_ k: SymmetricKey?) -> Data? { k?.withUnsafeBytes { Data($0) } }
+    check(bytes(lineKey(ka, kb.publicKey)) != nil && bytes(lineKey(ka, kb.publicKey)) == bytes(lineKey(kb, ka.publicKey))
+          && bytes(lineKey(ka, kb.publicKey)) != bytes(lineKey(ka, Curve25519.KeyAgreement.PrivateKey().publicKey)),
+          "both ends of a line derive the same key; anyone else a different one")
     check(tagVersion(URL(string: "https://github.com/sbrothers7/psst/releases/tag/v1.4.0")) == "1.4.0"
           && tagVersion(URL(string: "https://github.com/sbrothers7/psst/releases")) == nil && tagVersion(nil) == nil, "version from the latest release's tag")
     check(isNewer("1.10", than: "1.9") && isNewer("1.3.1", than: "1.3") && isNewer("1.4", than: "1.3.1") && isNewer("1.0\n", than: "0") && !isNewer("1.2", than: "1.2") && !isNewer("1.1", than: "1.2") && isNewer("1.1.2-1", than: "1.1.2") && isNewer("1.1.3", than: "1.1.2-1") && !isNewer("1.1.2", than: "1.1.2-1"),

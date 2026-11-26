@@ -16,6 +16,7 @@ extension App {
             status.button?.appearsDisabled = false
             server?.advertise(up: viaID, upSince: viaSince, hops: hops)  // Macs out of range can come through here
         case "rep": server?.absorb(m)  // this Mac is next in line to host
+        case "addrs": if remember(m.addrs ?? []) { probePeers() }  // where the next host can be found
         case "who":
             roster = m.names ?? []
             busy = m.busy ?? []
@@ -118,11 +119,58 @@ extension App {
     }
 
     func ad(_ r: NWBrowser.Result) -> HostAd? {  // nil: an older Psst, not part of the election
-        guard case .bonjour(let t) = r.metadata, let id = t["id"], let since = t["since"].flatMap(Double.init) else { return nil }
-        return HostAd(id: id, since: since, up: t["up"] ?? "", upSince: t["upsince"].flatMap(Double.init) ?? .infinity,
-                      hops: t["hops"].flatMap(Int.init) ?? maxHops)
+        guard case .bonjour(let t) = r.metadata else { return nil }
+        return hostAd(t.dictionary)
     }
-    var ads: [HostAd] { hosts.compactMap(ad) }
+    /// Macs seen over Bonjour, then ones only found by asking their network address.
+    var ads: [HostAd] {
+        let near = hosts.compactMap(ad)
+        var ids = Set(near.map(\.id) + [server?.id].compactMap { $0 })
+        return near + netAds.keys.sorted().compactMap { netAds[$0] }.filter { ids.insert($0.id).inserted }
+    }
+
+    /// Where to reach a Mac: its Bonjour listing (and the links it was seen on), else the address it answered on.
+    func endpoint(_ a: HostAd) -> (to: NWEndpoint, links: [NWInterface])? {
+        if let r = hosts.first(where: { ad($0)?.id == a.id }) { return (r.endpoint, r.interfaces) }
+        return a.addr.isEmpty ? nil : (.hostPort(host: .init(a.addr), port: port), [])
+    }
+
+    /// Keeps the addresses the host passed on (refreshed: Macs are there now). True when one is new.
+    // ponytail: up to 64 addresses, kept 3 days; a client could list any 4 on the network to be asked every 30 s.
+    func remember(_ addrs: [String]) -> Bool {
+        let now = Date().timeIntervalSince1970, fresh = onMyNetworks(addrs, localNets())
+        var p = peerAddrs.filter { now - $0.value < 3 * 86400 }
+        let new = fresh.contains { p[$0] == nil }
+        fresh.forEach { p[$0] = now }
+        peerAddrs = Dictionary(uniqueKeysWithValues: p.sorted { $0.value > $1.value }.prefix(64).map { ($0.key, $0.value) })
+        return new
+    }
+
+    /// Asks every remembered address on this network which host it's on ("ad"), like reading its Bonjour listing.
+    /// Some networks drop Bonjour but let Macs connect: then they still find each other, across the whole network.
+    func probePeers() {
+        let nets = localNets(), mine = onMyNetworks(Array(peerAddrs.keys), nets)
+        netAds = netAds.filter { mine.contains($0.key) }  // moved to another network
+        for addr in mine where probing.insert(addr).inserted {
+            let l = Line(NWConnection(to: .hostPort(host: .init(addr), port: port), using: tcp()))
+            var answered = false
+            l.onMsg = { [weak self, weak l] m in
+                guard let self, !answered, m.t == "ad", let a = m.ad.flatMap({ hostAd($0, addr: addr) }) else { return }
+                answered = true
+                l?.close()
+                self.netAds[addr] = a
+                self.peerAddrs[addr] = Date().timeIntervalSince1970
+                self.regroup()
+            }
+            l.onClose = { [weak self] in
+                self?.probing.remove(addr)
+                if !answered, self?.netAds[addr] != nil { self?.netAds[addr] = nil }
+            }
+            l.start()
+            l.send(Msg(t: "ad"))
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4) { l.close() }  // keeps the line until then
+        }
+    }
     var down: Set<String> { Set(downUntil.filter { $0.value > Date() }.keys) }
 
     /// The host this Mac should be on (see electHost).
@@ -138,15 +186,15 @@ extension App {
             l = Line(NWConnection(to: .hostPort(host: "127.0.0.1", port: port), using: tcp()))
             (through, dist) = (host, 0)
         case .direct(let a), .relay(let a):
-            guard let res = hosts.first(where: { ad($0)?.id == a.id }) else { return nil }
+            guard let e = endpoint(a) else { return nil }
             let params = tcp()
             if pin {  // a Mac is often reachable over several links (Wi-Fi, peer-to-peer); each retry pins the next,
                       // so a network that silently drops traffic can't trap us on it
-                let links: [NWInterface?] = [nil] + res.interfaces.filter { $0.type != .loopback }
+                let links: [NWInterface?] = [nil] + e.links.filter { $0.type != .loopback }
                 params.requiredInterface = links[attempts % links.count]
                 attempts += 1
             }
-            l = Line(NWConnection(to: res.endpoint, using: params))
+            l = Line(NWConnection(to: e.to, using: params))
             (through, dist) = (a.id, r == .direct(a) ? 1 : a.hops + 1)
         }
         l.start()
@@ -158,12 +206,14 @@ extension App {
     /// but only once that host answers, so a stale listing never pulls people off a host that works.
     func regroup() {
         guard let line else { return connect() }
-        guard !me.isEmpty, let want = target(), want.id != viaID else { return }
-        switch route(to: want.id, own: server?.id, ads: ads, down: down) {
+        guard !me.isEmpty, let want = target() else { return }
+        let r = route(to: want.id, own: server?.id, ads: ads, down: down)
+        if want.id == viaID { guard hops > 1, case .direct? = r else { return } }  // same host, now without the Macs in between
+        switch r {
         case .local?, .relay?: line.close()  // this Mac's own host answers; a relaying Mac is on it right now
         case .direct(let a)?:
-            guard let res = hosts.first(where: { ad($0)?.id == a.id }) else { return }
-            let probe = NWConnection(to: res.endpoint, using: tcp())
+            guard let e = endpoint(a) else { return }
+            let probe = NWConnection(to: e.to, using: tcp())
             probe.stateUpdateHandler = { [weak self] state in
                 if case .ready = state, let self, self.line === line { line.close() }  // reconnect lands on `want`
             }
@@ -215,7 +265,7 @@ extension App {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.connect() }
         }
         l.send(Msg(t: "hello", from: name, ts: lastSeen, hidden: myStatus == 2, dnd: myStatus == 1, noPings: !d.bool(forKey: "pings"), key: publicKey(identity),
-                   since: server?.since, pic: myPic, tag: myTag))
+                   since: server?.since, pic: myPic, tag: myTag, addrs: localNets().map { dotted($0.addr) }))
     }
 
     /// Every Mac hosts (see electHost). Restarting makes this one the newest host, e.g. after sleeping.

@@ -11,6 +11,7 @@ final class Server {
         var key = ""  // public key, passed on so members can encrypt to each other
         var since: Double?  // when this Mac's own host started; the oldest are next in line
         var pic = ""        // profile picture (see validPic)
+        var addrs: [String] = []  // its network addresses, passed on so Macs can connect where Bonjour is dropped
         var rooms: Set<String> = ["public"]
         var nicks: [String: String] = [:]  // room -> nickname there
         let send: (Msg) -> Void
@@ -35,6 +36,8 @@ final class Server {
     var dial: ((String, Int) -> Line?)?    // opens a line toward a host (set by the app, used to relay)
     private var listener: NWListener?, timers: [Timer] = [], nextID = 0
     let id = UUID().uuidString, since = Date().timeIntervalSince1970
+    lazy var txt = ["v": wireVersion, "id": id, "since": String(since), "up": "", "upsince": String(Double.infinity), "hops": "0"]  // see advertise
+    var shared: [String] = [], holdUntil: [String: Double] = [:]  // addresses last passed on; when new ones may be (see shareAddrs)
 
     init(retention: Double) { self.retention = retention }
 
@@ -44,7 +47,8 @@ final class Server {
         if advertise { self.advertise(up: "", upSince: .infinity, hops: 0) }
         timers = [.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.purge() },
                   .scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in  // "still here" for the next in line
-                      self?.successors.forEach { self?.clients[$0]?.send(Msg(t: "rep")) } }]
+                      self?.successors.forEach { self?.clients[$0]?.send(Msg(t: "rep")) } },
+                  .scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.shareAddrs() }]
     }
 
     /// Retries every second while it fails, e.g. while the previous host's listener is still closing after a wake.
@@ -66,7 +70,9 @@ final class Server {
             var first = true
             line.onMsg = { [weak self, weak line] m in
                 defer { first = false }
-                if first, m.t == "via", let line { self?.relay(id, line, to: m.text ?? "", hops: Int(m.ts ?? 0)) } else { self?.handle(id, m) }
+                if first, m.t == "via", let line { self?.relay(id, line, to: m.text ?? "", hops: Int(m.ts ?? 0)) }
+                else if first, m.t == "ad", let self { self.clients[id] = nil; line?.send(Msg(t: "ad", ad: self.txt)) }  // Bonjour, asked directly
+                else { self?.handle(id, m) }
             }
             line.onClose = { [weak self] in self?.remove(id) }
             self.add(id, send: line.send, close: line.close)
@@ -78,8 +84,8 @@ final class Server {
 
     /// Tells nearby Macs which host this Mac is on, so ones that can't reach it over Wi-Fi can go through here.
     func advertise(up: String, upSince: Double, hops: Int) {
-        listener?.service = NWListener.Service(name: "psst-" + id.prefix(8), type: serviceType, txtRecord: NWTXTRecord(
-            ["id": id, "since": String(since), "up": up, "upsince": String(upSince), "hops": String(hops)]))
+        txt = ["v": wireVersion, "id": id, "since": String(since), "up": up, "upsince": String(upSince), "hops": String(hops)]
+        listener?.service = NWListener.Service(name: "psst-" + id.prefix(8), type: serviceType, txtRecord: NWTXTRecord(txt))
     }
 
     func stop() {
@@ -154,6 +160,7 @@ final class Server {
             c.key = validKey(m.key) ?? c.key
             c.since = m.since ?? c.since
             c.pic = validPic(m.pic)
+            c.addrs = m.addrs.map { Array($0.compactMap(ipv4).map(dotted).prefix(4)) } ?? c.addrs
             c.ready = true
             clients[id] = c
             c.send(Msg(t: "you", from: c.name))
@@ -164,6 +171,7 @@ final class Server {
                 for o in clients.values { o.send(Msg(t: "pic", from: c.name, pic: c.pic)) }
             }
             if m.t == "hello" {
+                if !shared.isEmpty { c.send(Msg(t: "addrs", addrs: shared)) }  // last minute's list: nothing about them
                 replay("public", to: c, after: m.ts ?? 0)  // only what they haven't seen
                 if tookOver == nil, !restore.isEmpty { takeOver() }
                 restoreRooms(id)
@@ -496,6 +504,18 @@ final class Server {
         let keys = Dictionary(shown.filter { !$0.key.isEmpty }.map { ($0.name, $0.key) }, uniquingKeysWith: { a, _ in a })
         let msg = Msg(t: "who", names: shown.map(\.name).sorted(), busy: shown.filter(\.dnd).map(\.name).sorted(), keys: keys)
         for c in clients.values { c.send(msg) }
+    }
+
+    /// Tells everyone where the next host can be found if this one goes: this Mac and the next two in line,
+    /// never invisible people's. Once a minute, not when someone joins, and a new address only after a random
+    /// 1–10 minutes, so it can't be matched to whoever just arrived. This Mac's own goes out right away, even when
+    /// invisible: everyone connecting over the network sees it anyway.
+    func shareAddrs(now: Double = Date().timeIntervalSince1970) {
+        let next = Set(successors.compactMap { clients[$0] }.filter { !$0.hidden }.flatMap(\.addrs))
+        holdUntil = holdUntil.filter { next.contains($0.key) }
+        for a in next where holdUntil[a] == nil { holdUntil[a] = now + .random(in: 60...600) }
+        shared = Set(localNets().map { dotted($0.addr) } + next.filter { holdUntil[$0]! <= now }).sorted()
+        for c in clients.values where c.ready { c.send(Msg(t: "addrs", addrs: shared)) }
     }
 
     /// Tells a private room's members who is in it and their keys, so they can encrypt to each other.

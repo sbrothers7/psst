@@ -81,7 +81,7 @@ func helpTopics(shortcut: String) -> [(title: String, rows: [(key: String, dot: 
                  ("drag a message", nil, "move the overlay; right-click it to lock it in place")]),
      ("Symbols", [("2", .green, "in the chat bar: people online now, or in your room when you're in a private one. A lock beside it: that room is end-to-end encrypted"),
                   ("menu bar icon", .red, "not connected"),
-                  ("menu bar icon", .yellow, "the network blocks Macs from reaching each other, so Psst uses Wi-Fi directly (about 30 m)"),
+                  ("menu bar icon", .yellow, "the network blocks Macs from reaching each other, so Psst uses Wi-Fi directly between Macs about 30 m apart. Macs further away connect through up to 2 Macs in between"),
                   ("menu bar icon", .blue, "an update is available"),
                   ("★", nil, "a friend"),
                   ("◆", nil, "the creator of the room you're in"),

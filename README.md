@@ -23,8 +23,8 @@ Psst updates itself daily by default. The interval can be changed or updates tur
 | ⌘Q | Quit |
 
 - Type `/` for commands. `/help` opens a help page with every command explained. Full list: [commands.md](commands.md).
-- Macs running Psst find each other automatically, over the network or directly over Wi-Fi. Macs out of range connect through nearby ones.
-- A red dot on the menu bar icon means Psst isn't connected. A yellow dot means the network (or a VPN) blocks Macs from reaching each other, so Psst uses Wi-Fi directly, which reaches only Macs within about 30 m. A blue dot means an update is available.
+- Macs running Psst find each other automatically, over the network or directly over Wi-Fi. Macs out of range connect through nearby ones. Some networks hide Macs from each other but still let them connect: there, once one Mac is in, the others learn each other's network addresses and connect across the whole network.
+- A red dot on the menu bar icon means Psst isn't connected. A yellow dot means the network (or a VPN) blocks Macs from reaching each other, so Psst uses Wi-Fi directly between Macs about 30 m apart. Macs further away connect through up to 2 Macs in between. A blue dot means an update is available.
 - The chat bar shows how many people are online (● 2), or how many are in your private room, with a lock for its end-to-end encryption. In the menu, a red dot marks do not disturb, and ◆ marks the creator of the room you're in.
 - One Mac hosts. If it quits, the next one takes over with rooms and recent messages intact.
 - Messages fade after a few seconds. `/history on` keeps them.
@@ -36,10 +36,12 @@ Psst updates itself daily by default. The interval can be changed or updates tur
 
 ## Privacy
 
-- Private rooms are end-to-end encrypted. Public chat is not.
+- Everything Psst sends between Macs is encrypted: someone watching the network sees which Macs talk, not what they say. Someone who sits between two Macs and passes their traffic on could still read it.
+- Private rooms are also end-to-end encrypted, so not even the host can read them. Public chat is readable by the host and everyone in it.
 - Keys are remembered on first contact. If a user's key changes, Psst warns you and stops encrypting to them until you compare codes with `/key [username]` and confirm with `/trust [username]`.
-- Room passwords are hashed before sending, but anyone on the network can replay the hash.
-- Profile pictures are visible to everyone on the network.
+- Room passwords are hashed before sending, but the host can replay the hash.
+- Profile pictures are visible to everyone using Psst.
+- Once a minute, the host shares its own network address and those of the next two Macs in line to host (never invisible people's), so Macs can reconnect on networks that hide them from each other. A new address waits a random 1 to 10 minutes first, so it can't be matched to whoever just joined. Psst remembers these for 3 days.
 - The host sees who is online, room membership and message timing, but not private-room content. The next two Macs in line to host keep a copy.
 
 ## Build

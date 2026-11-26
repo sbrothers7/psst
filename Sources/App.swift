@@ -21,6 +21,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     var line: Line?
     var browser: NWBrowser?
     var hosts: [NWBrowser.Result] = [], attempts = 0
+    var netAds: [String: HostAd] = [:] { didSet { showState() } }  // network address -> the Mac that answered there
+    var probing: Set<String> = []
+    var peerAddrs: [String: Double] {  // network address -> when a Psst was last there (see probePeers)
+        get { d.dictionary(forKey: "peerAddrs") as? [String: Double] ?? [:] }
+        set { d.set(newValue, forKey: "peerAddrs") }
+    }
     var fails: [String: Int] = [:], downUntil: [String: Date] = [:], sleptAt: Date?  // see electHost, onWake
     var viaID = "", viaSince = 0.0, dialed = "", hops = 0  // the host this Mac is on, the Mac it dialled, how far
     var prevRoom = "public", lastSeen = 0.0  // to pick up where we were after reconnecting
@@ -32,7 +38,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     lazy var stackWidth = stack.widthAnchor.constraint(equalToConstant: barWidth)  // follows Size (applyScale)
     let countDot = NSTextField(labelWithString: "●"), countLabel = NSTextField(labelWithString: "")  // in the chat bar: ● online now
     let roomLock = NSImageView()  // left of the count, in a private (encrypted) room
-    var onWiFi: Bool { onlyWiFi(hosts.filter { ad($0)?.id != server?.id }.map { $0.interfaces.map(\.name) }) }
+    var onWiFi: Bool { netAds.isEmpty && onlyWiFi(hosts.filter { ad($0)?.id != server?.id }.map { $0.interfaces.map(\.name) }) }
     let stack = NSStackView(), field = NSTextField(), hintLabel = NSTextField(wrappingLabelWithString: "")
     let feedDoc = Flipped()
     var seen = Set<String>()  // messages already shown (time + sender), so a replay never repeats one
@@ -124,7 +130,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         if name == nil { showSettings(welcome: true) }  // first launch: pick a username before anything connects
         updateIfDue(launch: true)
         Timer.scheduledTimer(withTimeInterval: 600, repeats: true) { [weak self] _ in self?.updateIfDue() }
-        Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in self?.regroup() }
+        Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in self?.probePeers(); self?.regroup() }
         let ws = NSWorkspace.shared.notificationCenter
         ws.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in self?.sleptAt = Date() }
         ws.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in self?.onWake() }
@@ -139,6 +145,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         b.start(queue: .main)
         browser = b
         startHost()
+        probePeers()
     }
 
     func buildUI() {
@@ -473,7 +480,7 @@ extension App {
             return
         }
         let wifi = onWiFi
-        if wifi { add("Network Access Blocked: Psst is using Wi-Fi (decreased range)") }
+        if wifi { add("Network Access Blocked: Psst is using Wi-Fi, Mac to Mac (about 30 m each)") }
         let top = me.isEmpty ? "Looking for other machines…" : "\(me) in #\(room) · \(via)"
         add(top).attributedTitle = menuText(top, enabled: false)
         add("Write…   \(shortcut)", #selector(toggleInput))
