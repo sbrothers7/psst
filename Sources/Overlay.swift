@@ -42,7 +42,12 @@ final class Panel: NSPanel {
 /// Blurred bubble. Dragging it moves the overlay unless locked; right-click shows its menu.
 final class Flipped: NSView { override var isFlipped: Bool { true } }  // top-down scroll content
 final class Row: NSView { var ts = 0.0 }  // a feed row, kept in time order
-let barWidth: CGFloat = 380  // the chat bar, and the feed column above it
+/// Settings > Chat > Size: how big messages, the chat bar and the guide are. 1 = normal. Text and widths scale with it.
+var uiScale: CGFloat {
+    let s = UserDefaults.standard.double(forKey: "scale")
+    return s == 0 ? 1 : min(max(CGFloat(s), 0.7), 1.6)
+}
+var barWidth: CGFloat { 380 * uiScale }  // the chat bar, and the feed column above it
 
 final class Bubble: NSVisualEffectView {
     override func acceptsFirstMouse(for e: NSEvent?) -> Bool { true }

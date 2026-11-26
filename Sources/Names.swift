@@ -18,6 +18,34 @@ func nameProblem(_ n: String) -> String? {
 
 func validName(_ n: String) -> Bool { nameProblem(n) == nil }
 
+/// Each Mac picks a 4-digit tag once and keeps it, so two anas show as ana#0412 and ana#7731. Hosts pass it on.
+// ponytail: tells people apart, doesn't prove who's who (anyone can pick any tag); /key and /trust do that.
+func validTag(_ t: String?) -> String? { t.flatMap { $0.count == 4 && $0.allSatisfy { $0.isASCII && $0.isNumber } ? $0 : nil } }
+func newTag() -> String { String(format: "%04d", Int.random(in: 0...9999)) }
+
+/// "ana#0412" → ("ana", "0412"); an untagged name (from an older Psst) → ("ana", nil).
+func splitTag(_ handle: String) -> (name: String, tag: String?) {
+    guard let i = handle.firstIndex(of: "#") else { return (handle, nil) }
+    return (String(handle[..<i]), String(handle[handle.index(after: i)...]))
+}
+
+/// A username as typed in a command: name, or name#tag.
+func cleanHandle(_ s: String) -> String {
+    let p = splitTag(s.trimmingCharacters(in: .whitespaces)), tag = (p.tag ?? "").filter { $0.isASCII && $0.isNumber }.prefix(4)
+    return clean(p.name) + (tag.isEmpty ? "" : "#" + tag)
+}
+
+/// Who a typed username means among `names`: that exact name#tag, else everyone with that name (several: ask which one).
+/// No one: just the typed name, cleaned.
+func whoIs(_ typed: String, among names: [String]) -> [String] {
+    let t = cleanHandle(typed), low = t.lowercased()
+    if names.contains(t) { return [t] }
+    let hits = Set(names.filter { $0.lowercased() == low || (!t.contains("#") && splitTag($0).name.lowercased() == low) })
+    return hits.isEmpty ? [t] : hits.sorted()
+}
+
+func whichOne(_ names: [String]) -> String { "which one? " + names.joined(separator: ", ") }
+
 /// A nickname I give a friend, seen only on this Mac: letters, digits, spaces and - _ ' ., 20 at most.
 func friendAlias(_ raw: String) -> String {
     let kept = raw.filter { $0.isLetter || $0.isNumber || " -_'.".contains($0) }

@@ -29,6 +29,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     var room = "public", via = "", rooms: Set<String> = [], invited: Set<String> = []
     let status = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     let trayDot = Dot()  // on the menu bar icon (see showState)
+    lazy var stackWidth = stack.widthAnchor.constraint(equalToConstant: barWidth)  // follows Size (applyScale)
     let countDot = NSTextField(labelWithString: "●"), countLabel = NSTextField(labelWithString: "")  // in the chat bar: ● online/seen
     /// Everyone ever seen online, for the chat bar's count.
     // ponytail: one list for every network this Mac joins; key it by network if people move between groups.
@@ -46,7 +47,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     var suggestions: [Suggestion] = [], pick = 0
     var menu: (source: String, path: [String])?  // open menu: the typed text that lists it, then the rows picked into
     var hotKey: EventHotKeyRef?
-    var settings: NSWindow?
+    var settings: NSWindow?, helpWindow: NSWindow?
     let box = NSStackView(), welcomeText = NSTextField(wrappingLabelWithString: "")
     let tabs = NSTabView(), peopleBox = NSStackView(), aboutBox = NSStackView()  // settings: Profile is `box`
     let peopleScroll = NSScrollView(), peopleNote = NSTextField(labelWithString: "")
@@ -62,6 +63,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     let typingBox = NSButton(checkboxWithTitle: "Show typing indicators, and share mine", target: nil, action: nil)
     let mentionBox = NSButton(checkboxWithTitle: "Play a sound when someone @mentions me", target: nil, action: nil)
     let pingsBox = NSButton(checkboxWithTitle: "Let people ping me (flashes their name on my screen)", target: nil, action: nil)
+    let scaleSlider = NSSlider(value: 1, minValue: 0.7, maxValue: 1.6, target: nil, action: nil), scaleValue = NSTextField(labelWithString: "100%")
     let receiveBox = NSButton(checkboxWithTitle: "Receive messages (off: stay online, see nothing new)", target: nil, action: nil)
     let saveButton = NSButton(title: "Save", target: nil, action: nil)
     let shortcutButton = NSButton(title: "", target: nil, action: nil)
@@ -71,6 +73,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     var name: String? { d.string(forKey: "name") }  // nil until picked on first launch
     var myStatus: Int { d.integer(forKey: "status") }  // see statusNames
     var shortcut: String { d.string(forKey: "hotKeyLabel") ?? "⌥Space" }
+    var myTag: String {  // picked once and kept: others see me as name#tag (see validTag)
+        if let t = validTag(d.string(forKey: "tag")) { return t }
+        let t = newTag()
+        d.set(t, forKey: "tag")
+        return t
+    }
     var friends: [String] {
         get { d.stringArray(forKey: "friends") ?? [] }
         set { d.set(newValue, forKey: "friends") }
@@ -114,7 +122,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         let f = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 800, height: 600)
         if d.bool(forKey: "invisible") { d.set(2, forKey: "status"); d.removeObject(forKey: "invisible") }  // Psst 1.0 kept a bool
         d.register(defaults: ["cooldown": 10.0, "retention": 600.0, "status": 0, "pings": true, "receive": true, "invites": "everyone",
-                              "color": "auto", "picKind": "none", "history": false, "filter": true, "typing": true, "mentionSound": true, "alignMine": "left", "alignOthers": "left", "autoUpdate": true, "updateEvery": 86400.0, "hotKeyCode": kVK_Space, "hotKeyMods": optionKey, "hotKeyLabel": "⌥Space",
+                              "color": "auto", "picKind": "none", "history": false, "filter": true, "typing": true, "mentionSound": true, "alignMine": "left", "alignOthers": "left", "scale": 1.0, "autoUpdate": true, "updateEvery": 86400.0, "hotKeyCode": kVK_Space, "hotKeyMods": optionKey, "hotKeyLabel": "⌥Space",
                               "x": f.minX + 12, "y": f.minY + 12])
         buildUI()
         registerHotKey()
@@ -167,7 +175,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: feedDoc.leadingAnchor),
             stack.topAnchor.constraint(equalTo: feedDoc.topAnchor),
-            stack.widthAnchor.constraint(equalToConstant: barWidth),
+            stackWidth,
         ])
         let scroll = NSScrollView(frame: feed.contentView!.bounds)  // scrolls back once /history is on
         scroll.autoresizingMask = [.width, .height]
@@ -182,12 +190,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         _ = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .scrollWheel]) { [weak self] _ in self?.updateClickThrough() }
         _ = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .scrollWheel]) { [weak self] e in self?.updateClickThrough(); return e }
 
-        input = Panel(NSRect(x: 0, y: 0, width: 380, height: 28))
+        input = Panel(NSRect(x: 0, y: 0, width: barWidth, height: 28 * uiScale))
         input.delegate = self
         field.isBezeled = false
         field.drawsBackground = false
         field.focusRingType = .none
-        field.font = .systemFont(ofSize: 13)
+        field.font = .systemFont(ofSize: 13 * uiScale)
         field.cell?.wraps = true  // long messages wrap and the bar grows (fitInput); Shift+Enter starts a new line
         field.cell?.isScrollable = false
         field.lineBreakMode = .byWordWrapping
@@ -196,7 +204,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         grip.contentTintColor = .tertiaryLabelColor
         grip.setContentHuggingPriority(.required, for: .horizontal)
         for v in [countDot, countLabel] {  // plain labels: an attributed one loses its width in the stack
-            v.font = .systemFont(ofSize: 12)
+            v.font = .systemFont(ofSize: 12 * uiScale)
             v.setContentHuggingPriority(.defaultHigh, for: .horizontal)
             v.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
         }
@@ -213,10 +221,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         p.autoresizingMask = [.width, .height]
         input.contentView!.addSubview(p)
 
-        hints = Panel(NSRect(x: 0, y: 0, width: 380, height: 20))
+        hints = Panel(NSRect(x: 0, y: 0, width: barWidth, height: 20))
         hints.canKey = false
         hints.ignoresMouseEvents = true
-        hintLabel.preferredMaxLayoutWidth = 360
+        hintLabel.preferredMaxLayoutWidth = barWidth - 20
         let hp = pill(hintLabel)
         hp.frame = hints.contentView!.bounds
         hp.autoresizingMask = [.width, .height]
@@ -231,7 +239,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     /// The menu bar dot (see trayDotColor) and the chat bar's
     /// count: online now / everyone seen before.
     func showState() {
-        let all = Set(everSeen).union(roster)
+        let tagged = Set(roster.map { splitTag($0).name }.filter { n in roster.contains { $0.hasPrefix(n + "#") } })
+        let all = Set(everSeen).union(roster).filter { !tagged.contains($0) }  // ana from before tags is ana#0412 now
         if all.count != everSeen.count { everSeen = all.sorted() }
         let color = trayDotColor(connected: !me.isEmpty, wifiOnly: onWiFi, update: updateText(latest, state: nil).canUpdate)
         trayDot.isHidden = color == nil
@@ -278,8 +287,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         let t = field.stringValue, cell = field.cell!.copy() as! NSCell
         cell.stringValue = t.isEmpty || t.hasSuffix("\n") ? t + " " : t  // a new line just started counts
         let h = cell.cellSize(forBounds: NSRect(x: 0, y: 0, width: field.bounds.width, height: 10000)).height
-        let height = min(max(28, ceil(h) + 10), 150)
-        guard abs(input.frame.height - height) > 0.5 else { return }
+        let height = min(max(28 * uiScale, ceil(h) + 10), 150 * uiScale)
+        guard abs(input.frame.height - height) > 0.5 || abs(input.frame.width - barWidth) > 0.5 else { return }
         input.setFrame(NSRect(origin: anchor, size: NSSize(width: barWidth, height: height)), display: true)
         layout()
     }
@@ -325,15 +334,20 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         col.alignment = right ? .trailing : .leading
         col.spacing = 2
         let head = NSMutableAttributedString()
-        if !mine { head.append(NSAttributedString(string: (friendNames[from] ?? m.nick ?? from) + (r != "public" && roomOwner[r] == from ? " ◆" : ""), attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .semibold), .foregroundColor: nameColor(from, m.color)])) }
-        if r != "public" { head.append(NSAttributedString(string: (mine ? "" : " · ") + "#" + r, attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor])) }
+        if !mine {  // name, its #tag dimmed (not after a nickname), ◆ for the room's creator
+            let alias = friendNames[from] ?? m.nick, (plain, tag) = splitTag(from)
+            head.append(NSAttributedString(string: alias ?? plain, attributes: [.font: NSFont.systemFont(ofSize: 11 * uiScale, weight: .semibold), .foregroundColor: nameColor(from, m.color)]))
+            if alias == nil, let tag { head.append(NSAttributedString(string: "#" + tag, attributes: [.font: NSFont.systemFont(ofSize: 11 * uiScale, weight: .light), .foregroundColor: NSColor.tertiaryLabelColor])) }
+            if r != "public" && roomOwner[r] == from { head.append(NSAttributedString(string: " ◆", attributes: [.font: NSFont.systemFont(ofSize: 11 * uiScale), .foregroundColor: nameColor(from, m.color)])) }
+        }
+        if r != "public" { head.append(NSAttributedString(string: (mine ? "" : " · ") + "#" + r, attributes: [.font: NSFont.systemFont(ofSize: 11 * uiScale), .foregroundColor: NSColor.secondaryLabelColor])) }
         if head.length > 0 { col.addArrangedSubview(NSTextField(labelWithAttributedString: head)) }
         col.addArrangedSubview(bubble(text, tint: mine))
         var views: [NSView] = [col]
         if !mine, let img = pics[from].flatMap({ avatarImage($0, name: from, color: nameColor(from, m.color)) }) {
             let v = NSImageView(image: img)
-            v.widthAnchor.constraint(equalToConstant: 22).isActive = true
-            v.heightAnchor.constraint(equalToConstant: 22).isActive = true
+            v.widthAnchor.constraint(equalToConstant: 22 * uiScale).isActive = true
+            v.heightAnchor.constraint(equalToConstant: 22 * uiScale).isActive = true
             views.insert(v, at: right ? 1 : 0)  // on the outer side
         }
         let line = NSStackView(views: views)
@@ -346,7 +360,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         let label = NSTextField(wrappingLabelWithString: "")
         label.attributedStringValue = text
         label.isSelectable = false
-        label.preferredMaxLayoutWidth = 300
+        label.preferredMaxLayoutWidth = 300 * uiScale
         let b = pill(label)
         b.menu = ctx
         if tint {  // mine: the accent color through the blur
@@ -431,6 +445,14 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
 
 }
 
+/// A menu row with its #tags grey and thin. Colors set here stay, even on a greyed-out row, so it sets its own grey.
+func menuText(_ s: String, enabled: Bool) -> NSMutableAttributedString {
+    let font = NSFont.menuFont(ofSize: 0)
+    let t = NSMutableAttributedString(string: s, attributes: [.font: font, .foregroundColor: enabled ? NSColor.labelColor : NSColor.disabledControlTextColor])
+    dimTags(t, size: font.pointSize)
+    return t
+}
+
 extension App {
     // MARK: Menus
 
@@ -452,7 +474,8 @@ extension App {
         }
         let wifi = onWiFi
         if wifi { add("Network Access Blocked: Psst is using Wi-Fi (decreased range)") }
-        add(me.isEmpty ? "Looking for other machines…" : "\(me) in #\(room) · \(via)")
+        let top = me.isEmpty ? "Looking for other machines…" : "\(me) in #\(room) · \(via)"
+        add(top).attributedTitle = menuText(top, enabled: false)
         add("Write…   \(shortcut)", #selector(toggleInput))
         add("Receive messages", #selector(toggleReceive), on: d.bool(forKey: "receive"))
         menu.addItem(.separator())
@@ -462,15 +485,14 @@ extension App {
         for n in others {  // ★ friend, ◆ this room's creator, red dot: do not disturb
             let i = add((friends.contains(n) ? "★ " : "") + listed(n) + (room != "public" && roomOwner[room] == n ? " ◆" : ""),
                         room == "public" ? nil : #selector(invite(_:)), n, indent: true)
-            guard busy.contains(n) else { continue }
-            let font = NSFont.menuFont(ofSize: 0)  // colors set here stay, even on a greyed-out row
-            let t = NSMutableAttributedString(string: i.title, attributes: [.font: font, .foregroundColor: room == "public" ? NSColor.disabledControlTextColor : .labelColor])
-            t.append(NSAttributedString(string: " ●", attributes: [.font: font, .foregroundColor: NSColor.systemRed]))
+            let t = menuText(i.title, enabled: room != "public")
+            if busy.contains(n) { t.append(NSAttributedString(string: " ●", attributes: [.font: NSFont.menuFont(ofSize: 0), .foregroundColor: NSColor.systemRed])) }
             i.attributedTitle = t
         }
         menu.addItem(.separator())
 
         add("Settings…", #selector(openSettings))
+        add("Help…", #selector(openHelp))
         if updateText(latest, state: nil).canUpdate { add("Update available: \(latest!)…", #selector(updateNow)) }
         else { add("Psst \(appVersion) · auto update: " + (d.bool(forKey: "autoUpdate") ? "on" : "off")) }
         menu.addItem(NSMenuItem(title: "Quit Psst", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))

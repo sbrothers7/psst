@@ -107,13 +107,23 @@ let emojiIndex: [(code: String, emoji: String)] = {
 // MARK: - Text styling
 
 func styled(_ s: String, dim: Bool = false, bold: Bool = false, color: NSColor? = nil) -> NSAttributedString {
-    NSAttributedString(string: s, attributes: [.font: NSFont.systemFont(ofSize: 12, weight: bold ? .semibold : .regular),
-                                               .foregroundColor: color ?? (dim ? NSColor.secondaryLabelColor : NSColor.labelColor)])
+    let out = NSMutableAttributedString(string: s, attributes: [.font: NSFont.systemFont(ofSize: 12 * uiScale, weight: bold ? .semibold : .regular),
+                                                                .foregroundColor: color ?? (dim ? NSColor.secondaryLabelColor : NSColor.labelColor)])
+    dimTags(out, size: 12 * uiScale)
+    return out
 }
+
+/// The #0412 after a name: grey and thin, there to tell people apart, not to read. Room names (#chess) aren't touched.
+func dimTags(_ s: NSMutableAttributedString, size: CGFloat) {
+    for m in tagPattern.matches(in: s.string, range: NSRange(location: 0, length: s.length)) {
+        s.addAttributes([.foregroundColor: NSColor.tertiaryLabelColor, .font: NSFont.systemFont(ofSize: size, weight: .light)], range: m.range)
+    }
+}
+let tagPattern = try! NSRegularExpression(pattern: "(?<=[\\p{L}\\p{N}_-])#[0-9]{4}(?![0-9])")
 
 /// Inline markdown: **bold**, *italic*, `code`, ~~strike~~, [link](url).
 /// Foundation parses it; AppKit labels ignore the parsed intents, so they're mapped to fonts here.
-func markdown(_ s: String, size: CGFloat = 12) -> NSAttributedString {
+func markdown(_ s: String, size: CGFloat = 12 * uiScale) -> NSAttributedString {
     let base = NSFont.systemFont(ofSize: size)
     guard let md = try? AttributedString(markdown: s, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))
     else { return NSAttributedString(string: s, attributes: [.font: base, .foregroundColor: NSColor.labelColor]) }
@@ -163,10 +173,11 @@ let swears: NSRegularExpression = {
 }()
 
 /// Whether the text @mentions any of these names (a username or a nickname), in any case.
-func mentions(_ text: String, _ names: [String]) -> Bool {
+func mentions(_ text: String, _ names: [String]) -> Bool {  // @ana: every ana; @ana#0412: that one
     names.contains { n in
-        !n.isEmpty && text.range(of: "(?<![\\p{L}\\p{N}_-])@" + NSRegularExpression.escapedPattern(for: n) + "(?![\\p{L}\\p{N}_-])",
-                                 options: [.regularExpression, .caseInsensitive]) != nil
+        !n.isEmpty && [(n, "(?![\\p{L}\\p{N}_-])"), (splitTag(n).name, "(?![\\p{L}\\p{N}_#-])")].contains { name, end in
+            text.range(of: "(?<![\\p{L}\\p{N}_-])@" + NSRegularExpression.escapedPattern(for: name) + end, options: [.regularExpression, .caseInsensitive]) != nil
+        }
     }
 }
 

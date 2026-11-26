@@ -119,9 +119,9 @@ extension App {
         // Columns: ▸ marker | label (+ dot) | detail. Wrapped lines stay under their column instead of the left edge.
         let per = 10, start = pick / per * per, pages = (suggestions.count + per - 1) / per  // a page at a time; arrows flip
         let page = suggestions.enumerated().filter { (start..<start + per).contains($0.offset) }
-        let bold = NSFont.systemFont(ofSize: 12, weight: .semibold), indent: CGFloat = 14
+        let bold = NSFont.systemFont(ofSize: 12 * uiScale, weight: .semibold), indent: CGFloat = 14 * uiScale
         let widest = page.filter { !$0.element.detail.isEmpty }.map { ($0.element.label + ($0.element.dot == nil ? "" : " ●") as NSString).size(withAttributes: [.font: bold]).width }.max() ?? 0
-        let col = indent + min(widest, 190) + 16
+        let col = indent + min(widest, 190 * uiScale) + 16
         let rows = NSMutableParagraphStyle(), head = NSMutableParagraphStyle()
         rows.tabStops = [NSTextTab(textAlignment: .left, location: indent), NSTextTab(textAlignment: .left, location: col)]
         rows.headIndent = col
@@ -162,7 +162,7 @@ extension App {
         s.append(body)
         hintLabel.attributedStringValue = s
         let h = hintLabel.intrinsicContentSize.height + 10
-        hints.setFrame(NSRect(x: input.frame.minX, y: input.frame.maxY + 4, width: 380, height: h), display: true)
+        hints.setFrame(NSRect(x: input.frame.minX, y: input.frame.maxY + 4, width: barWidth, height: h), display: true)
         hints.orderFrontRegardless()
     }
 
@@ -190,7 +190,10 @@ extension App {
         switch parts[0] {  // these work without a host
         case "/quit": return NSApp.terminate(nil)
         case "/settings": return showSettings(welcome: false)
-        case "/help": return note(arg.isEmpty ? commands.map(usage).joined(separator: " · ") : commandHelp(arg) ?? "no command /\(arg.drop { $0 == "/" }). /help lists them all")
+        case "/help":
+            if arg.isEmpty { return showHelp() }
+            guard let name = commandName(arg) else { return note("no command /\(arg.drop { $0 == "/" }). /help lists them all") }
+            return showHelp(name)
         case "/history":  // on: every message stays and the feed scrolls back; off: they fade. Bare: switch
             guard let on = arg.isEmpty ? !history : onOff(arg) else { return note("/history on (1) or off (0)") }
             setHistory(on)
@@ -201,18 +204,24 @@ extension App {
             guard let on = arg.isEmpty ? !d.bool(forKey: "receive") : onOff(arg) else { return note("/messages on (1) or off (0)") }
             return setReceive(on)
         case "/block":
-            let who = clean(arg)
+            let hits = whoIs(arg, among: roster.filter { $0 != me } + blocked)
+            guard hits.count == 1 else { return note(whichOne(hits)) }
+            let who = hits[0]
             if who.isEmpty { return note(blocked.isEmpty ? "no one blocked" : "blocked: " + blocked.joined(separator: ", ")) }
             if blocked.contains(who) { blocked.removeAll { $0 == who }; return note("unblocked \(who)") }
             blocked.append(who)
             return note("blocked \(who): you won't see their messages or invites")
         case "/key":
-            let who = clean(arg)
-            if who.isEmpty { return note("your key: \(fingerprint(publicKey(identity))). Compare in person with /key \(name ?? "you") on their Mac.") }
+            let hits = whoIs(arg, among: Array(known.keys))
+            guard hits.count == 1 else { return note(whichOne(hits)) }
+            let who = hits[0]
+            if who.isEmpty { return note("your key: \(fingerprint(publicKey(identity))). Compare in person with /key \(me.isEmpty ? name ?? "you" : me) on their Mac.") }
             guard let k = known[who] else { return note("no key seen for \(who) yet") }
             return note("\(who): \(fingerprint(k))" + (changed[who] != nil ? ". Changed, not trusted. /trust \(who) once it matches" : ""))
         case "/trust":
-            let who = clean(arg)
+            let hits = whoIs(arg, among: Array(changed.keys))
+            guard hits.count == 1 else { return note(whichOne(hits)) }
+            let who = hits[0]
             guard let k = changed.removeValue(forKey: who) else { return note("nothing to trust for \(who)") }
             pins[who] = k
             return note("trusting \(who)'s new key \(fingerprint(k))")
@@ -260,9 +269,13 @@ extension App {
         case "/status":
             guard let n = statusArg(arg) else { return note("you're \(statusNames[myStatus]). /status 0 online · 1 do not disturb · 2 invisible") }
             setStatus(n)
-        case "/online": note(arg.isEmpty ? "online: " + roster.map(listed).joined(separator: ", ") : roster.contains(clean(arg)) ? "\(clean(arg)) is online" : "no one online named \(arg)")
+        case "/online":
+            let hits = whoIs(arg, among: roster)
+            note(arg.isEmpty ? "online: " + roster.map(listed).joined(separator: ", ")
+                 : hits.allSatisfy(roster.contains) ? hits.map(listed).joined(separator: ", ") + (hits.count == 1 ? " is online" : " are online") : "no one online named \(arg)")
         case _ where s.hasPrefix("/"): note("no command \(parts[0]). /help lists them all")
         default:
+            menu = nil  // a message sent: an open list (/online…) is done
             let color = d.string(forKey: "color")
             guard room != "public" else { return line.send(Msg(t: "say", room: room, text: emojify(s), color: color)) }
             let to = (members[room] ?? [:]).filter { pins[$0.key] == $0.value }  // only people whose key we trust

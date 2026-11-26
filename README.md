@@ -7,7 +7,7 @@ Chat overlay for Macs on the same local network. No accounts, no central server.
 1. Download `Psst.zip` from [Releases](../../releases/latest) and unzip it.
 2. Move `Psst.app` to a folder in your home folder, such as `~/Applications`.
 3. On first launch, right-click `Psst.app` and choose **Open** (the app is not notarized), then **allow local network access**. If it does not open, System Settings > Privacy & Security > Open Anyways (scroll down).
-4. Choose a username. It can be changed every two weeks.
+4. Choose a username. It can be changed every two weeks. Your Mac also picks a permanent 4-digit tag, so two people named ana show as `ana#0412` and `ana#7731`.
 
 Psst updates itself daily by default. The interval can be changed or updates turned off in Settings. Psst checks on launch; Settings > General shows when an update is available, with **Check Now** and **Update Now**.
 
@@ -22,14 +22,15 @@ Psst updates itself daily by default. The interval can be changed or updates tur
 | Esc | Go back or close |
 | ⌘Q | Quit |
 
-- Type `/` for commands, or `/help`. Full list: [commands.md](commands.md).
+- Type `/` for commands. `/help` opens a help page with every command explained. Full list: [commands.md](commands.md).
 - Macs running Psst find each other automatically, over the network or directly over Wi-Fi. Macs out of range connect through nearby ones.
 - A red dot on the menu bar icon means Psst isn't connected. A yellow dot means the network (or a VPN) blocks Macs from reaching each other, so Psst uses Wi-Fi directly, which reaches only Macs within about 30 m. A blue dot means an update is available.
 - The chat bar shows how many people are online out of everyone seen before (● 2/13). In the menu, a red dot marks do not disturb, and ◆ marks the creator of the room you're in.
 - One Mac hosts. If it quits, the next one takes over with rooms and recent messages intact.
 - Messages fade after a few seconds. `/history on` keeps them.
 - Swearing and NSFW words are hidden in messages by default and not allowed in usernames.
-- Typing indicators, mention sounds, pings and which side messages appear on can be changed in Settings.
+- Typing indicators, mention sounds, pings, which side messages appear on and their size can be changed in Settings.
+- When two people share a name, add the tag: `@ana#0412`, `/ping ana#0412`.
 - `/messages off` stops new messages while you stay online. `/friend rename` gives a friend a name only you see.
 - Drag a message to move the overlay. Right-click to lock its position.
 

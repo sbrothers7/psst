@@ -1,6 +1,6 @@
 # Commands
 
-`*` marks a required parameter. Commands that list items open a menu when sent without arguments: ↑↓ to move, Enter to select, Esc to go back.
+`*` marks a required parameter. Wherever a username goes, `name#tag` (e.g. `ana#0412`) picks one person when several share a name. Commands that list items open a menu when sent without arguments: ↑↓ to move, Enter to select, Esc to go back.
 
 ## General
 
@@ -16,7 +16,7 @@
 | `/messages [on\|off]` | Stop receiving messages while staying online, or resume. `1` and `0` work too. No argument toggles |
 | `/key [username]` | Show a key code for verification. No argument shows yours |
 | `/trust [username]*` | Accept a user's new key |
-| `/help [command]` | Explain a command. No argument lists them all |
+| `/help [command]` | Open the help page, at a command if given |
 | `/settings` | Open settings |
 | `/quit` | Quit Psst |
 

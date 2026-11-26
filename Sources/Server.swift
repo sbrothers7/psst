@@ -147,7 +147,7 @@ final class Server {
         case "hello", "nick":
             let was = c
             let asked = clean(m.from ?? "")
-            c.name = unique(validName(asked) ? asked : "", id)  // a modified Psst could skip the name check
+            c.name = unique(validName(asked) ? asked : "", tag: validTag(m.tag), id)  // a modified Psst could skip the name check
             c.hidden = m.hidden ?? false
             c.dnd = m.dnd ?? false
             c.noPings = m.noPings ?? false
@@ -236,7 +236,10 @@ final class Server {
 
         case "accept":  // any member may let people in, like /invite
             guard room != "public", c.rooms.contains(room) else { return note("join the room first") }
-            let asking = (requests[room] ?? []).filter { clients[$0] != nil }, who = clean(m.text ?? "")
+            let asking = (requests[room] ?? []).filter { clients[$0] != nil }, typed = clean(m.text ?? "")
+            let hits = typed.isEmpty || typed == "all" ? [typed] : whoIs(m.text ?? "", among: asking.compactMap { clients[$0]?.name })
+            guard hits.count == 1 else { return note(whichOne(hits), room) }
+            let who = hits[0]
             let picked = who == "all" ? asking : who.isEmpty ? Array(asking.suffix(1)) : asking.filter { clients[$0]?.name == who }
             guard !picked.isEmpty else {
                 return note(who.isEmpty || who == "all" ? "no one is asking to join" : "\(who) isn't asking to join", room)
@@ -248,7 +251,7 @@ final class Server {
             let n = clean(m.text ?? "")
             if !n.isEmpty {
                 if let problem = nameProblem(n) { return note(problem, room) }
-                let taken = clients.contains { $0.key != id && ($0.value.name == n || ($0.value.rooms.contains(room) && $0.value.nicks[room] == n)) }
+                let taken = clients.contains { $0.key != id && (splitTag($0.value.name).name == n || ($0.value.rooms.contains(room) && $0.value.nicks[room] == n)) }
                 guard !taken else { return note("\(n) is taken", room) }
             }
             let old = c.nicks[room] ?? c.name
@@ -258,7 +261,9 @@ final class Server {
             members(room)
 
         case "invite":
-            let name = clean(m.text ?? "")
+            let hits = whoIs(m.text ?? "", among: clients.values.filter { $0.ready && !$0.hidden }.map(\.name) + Array(bans[room] ?? []))
+            guard hits.count == 1 else { return note(whichOne(hits)) }
+            let name = hits[0]
             guard room != "public", c.rooms.contains(room) else { return note("make a room first: /room create [room name]") }
             guard types[room] != 1 else { return note("#\(room) is password only: share the password, or /room set type 2", room) }
             guard bans[room]?.contains(name) != true else { return note("\(name) is banned from #\(room): /room member ban \(name) lifts it", room) }
@@ -275,7 +280,9 @@ final class Server {
             remove(id, from: room, note: m.text == "silent" ? nil : "\(c.name) has left #\(room)")
 
         case "kick", "ban":  // the room's creator only; a ban also keeps them out, and banning again lifts it
-            let name = clean(m.text ?? ""), did = m.t == "ban" ? "banned" : "removed"
+            let hits = whoIs(m.text ?? "", among: clients.values.filter(\.ready).map(\.name) + Array(bans[room] ?? []))
+            guard hits.count == 1 else { return note(whichOne(hits), room) }
+            let name = hits[0], did = m.t == "ban" ? "banned" : "removed"
             guard room != "public", c.rooms.contains(room) else { return note("/join the room first") }
             guard owners[room] == id else { return note("only the room's creator can \(m.t) people", room) }
             guard !name.isEmpty, name != c.name else { return note(name.isEmpty ? "/room member \(m.t) [username]" : "you can't \(m.t) yourself", room) }
@@ -297,9 +304,11 @@ final class Server {
             remove(t, from: room, note: "\(c.name) \(did) \(name) from #\(room)")
 
         case "ping":  // flashes "ana has pinged you [in #room]" on their screens
-            let name = clean(m.text ?? "")
+            let hits = whoIs(m.text ?? "", among: clients.filter { $0.key != id && $0.value.ready && !$0.value.hidden }.map(\.value.name))
+            guard hits.count == 1 else { return note(whichOne(hits)) }
+            let name = hits[0]
             guard let target = clients.first(where: { $0.key != id && $0.value.ready && $0.value.name == name && !$0.value.hidden })
-            else { return note(name == c.name ? "you can't ping yourself" : "no one named \(name)") }
+            else { return note(whoIs(m.text ?? "", among: [c.name]) == [c.name] ? "you can't ping yourself" : "no one named \(name)") }
             guard !target.value.dnd else { return note("\(name) is in do not disturb") }
             guard !target.value.noPings else { return note("\(name) turned pings off") }
             let now = Date().timeIntervalSince1970, wait = 30 - (now - (lastPing[c.name] ?? 0))
@@ -520,10 +529,11 @@ final class Server {
         }
     }
 
-    func unique(_ base: String, _ id: Int) -> String {
-        let base = base.isEmpty ? "anon" : base
-        var name = base, i = 2
-        while clients.contains(where: { $0.key != id && $0.value.ready && $0.value.name == name }) { name = "\(base)\(i)"; i += 1 }
+    /// name#tag as the client sent it; only if that's taken (the same Mac reconnecting, or a rare double) a number joins the name.
+    func unique(_ base: String, tag: String? = nil, _ id: Int) -> String {
+        let base = base.isEmpty ? "anon" : base, tail = tag.map { "#" + $0 } ?? ""
+        var name = base + tail, i = 2
+        while clients.contains(where: { $0.key != id && $0.value.ready && $0.value.name == name }) { name = "\(base)\(i)\(tail)"; i += 1 }
         return name
     }
 }

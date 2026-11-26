@@ -32,7 +32,7 @@ func onlyWiFi(_ links: [[String]]) -> Bool {
 // MARK: - Hosting: every Mac hosts, everyone shares the oldest
 //
 // Every Mac runs a host and advertises it. All Macs join the same one, the longest-running host still reachable,
-// so no one has to type /host and a restarted Mac never splits the class. The host keeps the next two in line
+// so no one has to type /host and a restarted Mac never splits the group. The host keeps the next two in line
 // supplied with a copy of its rooms and recent messages; if it disappears they're elected next and carry on.
 // Macs out of Wi-Fi range of the host reach it through a Mac in between (up to 3 hops).
 
@@ -102,6 +102,7 @@ struct Msg: Codable {
     var descs: [String: String]? = nil // rooms: room -> its description
     var pic: String? = nil            // hello/nick/pic: profile picture: "letters", a base64 JPEG or PNG, "" for none
     var types: [String: Int]? = nil   // rooms/create: room -> who can get in (see typeNames)
+    var tag: String? = nil            // hello/nick: my permanent 4-digit tag; the host shows me as name#tag
 }
 
 // MARK: - Wire: newline-delimited JSON over one TCP connection

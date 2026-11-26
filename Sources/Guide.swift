@@ -18,7 +18,7 @@ let commands: [(name: String, args: [String], help: String)] = [  // help fits o
     ("/block", ["username"], "block or unblock (blank to list)"),
     ("/history", ["on|off"], "on (1): keep messages and scroll back; off (0): they fade"),
     ("/messages", ["on|off"], "off (0): stay online, but receive nothing new · /m"),
-    ("/help", ["command"], "what a command does; blank lists them all"),
+    ("/help", ["command"], "the help page, or one command on it"),
     ("/settings", [], "open settings"),
     ("/key", ["username"], "key code to compare in person"),
     ("/trust", ["username*"], "trust someone's new key"),
@@ -103,10 +103,10 @@ final class PairingEditor: NSTextView {
 }
 
 /// "/friend [list|add|remove]* [username]": one placeholder per parameter, written like the README; * = required.
-/// /help [command]: its format and what it does. Short forms work (/help r); nil when there's no such command.
-func commandHelp(_ name: String) -> String? {
+/// /help [command]: the command's full name, short forms too (r → /room); nil when there's no such command.
+func commandName(_ name: String) -> String? {
     let n = "/" + name.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
-    return commands.first { $0.name == (shortForms[n] ?? n) }.map { "\(usage($0)): \($0.help)" }
+    return commands.first { $0.name == (shortForms[n] ?? n) }?.name
 }
 
 func usage(_ c: (name: String, args: [String], help: String)) -> String {
@@ -232,7 +232,7 @@ func actions(_ n: String, _ c: Ctx) -> [Suggestion] {
 /// Commands that, sent bare, open their list as a menu to pick from. The value is the typed text that lists it.
 func listMenu(_ s: String) -> String? {
     let c = s.lowercased().split(separator: " ").joined(separator: " ")
-    let lists = ["/help", "/online", "/status", "/ping", "/room", "/browse", "/join", "/request", "/invite", "/block", "/friend list", "/friend add", "/friend remove",
+    let lists = ["/online", "/status", "/ping", "/room", "/browse", "/join", "/request", "/invite", "/block", "/friend list", "/friend add", "/friend remove",
                  "/room member list", "/room member kick", "/room member ban"]
     return c == "/friend" ? "/friend list " : c == "/room member" ? "/room member list " : lists.contains(c) ? c + " " : nil
 }
@@ -338,7 +338,7 @@ func suggest(_ text: String, _ c: Ctx) -> [Suggestion] {
         case ("/ping", 1): return plain(others)
         case ("/trust", 1): return plain(c.changed)
         case ("/history", 1), ("/messages", 1): return plain(["on", "off"])
-        case ("/help", 1):  // every command with its format; picking one explains it in the chat
+        case ("/help", 1):  // every command with its format; picking one opens the help page there
             return commands.filter { fits(String($0.name.dropFirst())) || fits($0.name) }
                 .map { Suggestion(label: usage($0), detail: $0.help, replace: "/help " + $0.name.dropFirst(), run: true) }
         case ("/leave", 1): return plain(["silent"])
@@ -352,7 +352,7 @@ func suggest(_ text: String, _ c: Ctx) -> [Suggestion] {
         default: return []
         }
     }
-    if let r = text.range(of: #"(?<!\S)@[\p{L}\p{N}_-]*$"#, options: .regularExpression) {  // "@an": who to mention
+    if let r = text.range(of: #"(?<!\S)@[\p{L}\p{N}_#-]*$"#, options: .regularExpression) {  // "@an" or "@ana#04": who to mention
         let q = text[r].dropFirst().lowercased(), mine = [c.me, c.nicks[c.me] ?? c.me]
         var seen = Set<String>()
         let names = (c.roster + c.members + c.nicks.values).filter { !mine.contains($0) && $0.lowercased().hasPrefix(q) && seen.insert($0).inserted }

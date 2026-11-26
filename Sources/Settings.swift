@@ -54,6 +54,12 @@ extension App {
         updateBox.action = #selector(updateBoxChanged)
         filterBox.target = self
         filterBox.action = #selector(filterChanged)
+        scaleSlider.target = self
+        scaleSlider.action = #selector(scaleChanged)
+        scaleSlider.numberOfTickMarks = 10  // 70% to 160%, in tens
+        scaleSlider.allowsTickMarkValuesOnly = true
+        scaleSlider.isContinuous = false
+        scaleSlider.widthAnchor.constraint(equalToConstant: 200).isActive = true
         receiveBox.target = self
         receiveBox.action = #selector(receiveChanged)
         pingsBox.target = self
@@ -103,6 +109,7 @@ extension App {
             [label("Messages fade after"), popups[2]],
             [label("My messages"), popups[7]],
             [label("Others' messages"), popups[8]],
+            [label("Size"), NSStackView(views: [scaleSlider, scaleValue])],
             [none, receiveBox],
             [none, filterBox],
             [none, typingBox],
@@ -199,6 +206,7 @@ extension App {
         let rows: [[NSView]] = list.isEmpty ? [[small("People show up here once they open Psst on this network.")]]
             : [[small("Name"), small("Friend"), small("Blocked")]] + list.map { who in
                 let t = NSMutableAttributedString(string: listed(who), attributes: [.font: NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor.labelColor])
+                dimTags(t, size: 13)
                 let on = online.contains(who)
                 t.append(NSAttributedString(string: on ? "  ●" : "  ○", attributes: [.font: NSFont.systemFont(ofSize: 11),
                     .foregroundColor: on ? NSColor.systemGreen : NSColor.tertiaryLabelColor]))
@@ -267,6 +275,7 @@ extension App {
         nameNote.stringValue = name == nil ? "Pick the name others will see. After this you can change it once every 2 weeks."
             : left > 0 ? "You can change your name again in \(waitText(left))."
             : "You can change your name now, then not again for 2 weeks."
+        if let name { nameNote.stringValue = "Others see you as \(name)#\(myTag). " + nameNote.stringValue }  // the tag never changes
         for p in popups {
             let current = d.object(forKey: p.identifier!.rawValue) as? NSObject
             p.selectItem(at: p.itemArray.firstIndex { ($0.representedObject as? NSObject)?.isEqual(current) == true } ?? 0)
@@ -277,6 +286,8 @@ extension App {
         mentionBox.state = d.bool(forKey: "mentionSound") ? .on : .off
         pingsBox.state = d.bool(forKey: "pings") ? .on : .off
         receiveBox.state = d.bool(forKey: "receive") ? .on : .off
+        scaleSlider.doubleValue = Double(uiScale)
+        scaleValue.stringValue = "\(Int((uiScale * 100).rounded()))%"
         updateBox.state = d.bool(forKey: "autoUpdate") ? .on : .off
         setUpdateState(updateState)
         popups[6].isEnabled = updateBox.state == .on
@@ -350,7 +361,7 @@ extension App {
         }
     }
 
-    func sendProfile() { line?.send(Msg(t: "nick", from: name, hidden: myStatus == 2, dnd: myStatus == 1, noPings: !d.bool(forKey: "pings"), key: publicKey(identity), pic: myPic)) }
+    func sendProfile() { line?.send(Msg(t: "nick", from: name, hidden: myStatus == 2, dnd: myStatus == 1, noPings: !d.bool(forKey: "pings"), key: publicKey(identity), pic: myPic, tag: myTag)) }
 
     /// "Choose a picture…" asks for an image; cancelling goes back to what was set before.
     func picChanged(old: Any?) {
@@ -453,7 +464,9 @@ extension App {
     /// /friend [list|add|remove] [username]. Friends are kept on this Mac only.
     func friend(_ arg: String) -> String {
         let w = arg.split(separator: " ").map(String.init)
-        let who = w.count > 1 ? clean(w[1]) : ""
+        let hits = w.count > 1 ? whoIs(w[1], among: roster.filter { $0 != me } + friends) : [""]
+        guard hits.count == 1 else { return whichOne(hits) }
+        let who = hits[0]
         switch (w.first ?? "list", who.isEmpty) {
         case ("list", _):
             let online = friends.filter(roster.contains)
@@ -484,6 +497,19 @@ extension App {
         receiveBox.state = on ? .on : .off
         if !on { typers = [:]; showTyping() }
         show(on ? "receiving messages again" : "messages off: you stay online, but nothing new shows. /messages on to resume", dim: true)
+    }
+
+    /// Settings > Chat > Size: new messages, the chat bar and the guide at the new size; messages already shown stay as they are.
+    @objc func scaleChanged() {
+        d.set((scaleSlider.doubleValue * 10).rounded() / 10, forKey: "scale")
+        scaleValue.stringValue = "\(Int((uiScale * 100).rounded()))%"
+        field.font = .systemFont(ofSize: 13 * uiScale)
+        for v in [countDot, countLabel] { v.font = .systemFont(ofSize: 12 * uiScale) }
+        hintLabel.preferredMaxLayoutWidth = barWidth - 20
+        stackWidth.constant = barWidth
+        fitInput()
+        layout()
+        show("messages at \(scaleValue.stringValue)", dim: true)
     }
 
     @objc func toggleReceive() { setReceive(!d.bool(forKey: "receive")) }

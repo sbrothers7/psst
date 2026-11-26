@@ -107,9 +107,40 @@ func selftest() {
 
     func hint(_ t: String, _ roster: [String] = [], _ rooms: [String] = []) -> [Suggestion] { suggest(t, Ctx(roster: roster, joined: rooms)) }
     check(hint("/").count == commands.count, "/ lists every command")
-    check(commandHelp("room") == "/room [create|set|member]*: make a room, change one, or see who's in it · /r, /r c" && commandHelp("/R")?.hasPrefix("/room ") == true
-          && commandHelp("m")?.hasPrefix("/messages ") == true && commandHelp("nope") == nil, "/help [command]: format and what it does, short forms too")
-    check(listMenu("/help") == "/help " && suggest("/help ", Ctx()).count == commands.count
+    let tagA = "0412", tagB = "7731"
+    let tagged = "ana#0412 has joined #1234 · bo#77777 · #chess"
+    check(tagPattern.matches(in: tagged, range: NSRange(location: 0, length: (tagged as NSString).length)).map { (tagged as NSString).substring(with: $0.range) } == ["#0412"],
+          "only a name's #tag is greyed, not rooms")
+    check(validTag(newTag()) != nil && validTag("0412") == "0412" && validTag("412") == nil && validTag("04a2") == nil && validTag("٠١٢٣") == nil && validTag(nil) == nil,
+          "tags: 4 digits, picked on this Mac")
+    check(cleanHandle(" ana#04x12 ") == "ana#0412" && cleanHandle("bo b!") == "bob" && cleanHandle("ana#") == "ana" && splitTag("ana#0412") == ("ana", "0412")
+          && splitTag("ana").tag == nil, "name#tag as typed")
+    let twins = ["ana#0412", "ana#7731", "bo#0001"]
+    check(whoIs("bo", among: twins) == ["bo#0001"] && whoIs("ana", among: twins) == ["ana#0412", "ana#7731"] && whoIs("ANA#7731", among: twins) == ["ana#7731"]
+          && whoIs("zed", among: twins) == ["zed"] && whoIs("ana#0412", among: twins + ["ana#0412"]) == ["ana#0412"], "a name finds the one person, or everyone sharing it")
+    check(mentions("hi @ana", ["ana#0412"]) && mentions("hi @ana#0412!", ["ana#0412"]) && !mentions("hi @ana#7731", ["ana#0412"]) && !mentions("hi @anaa", ["ana#0412"]),
+          "@name mentions every ana, @name#tag just one")
+    check(suggest("hi @an", Ctx(me: "me#0001", roster: ["ana#0412", "me#0001"])).map(\.replace) == ["hi @ana#0412"] && suggest("@ana#7", Ctx(roster: ["ana#0412", "ana#7731"])).map(\.replace) == ["@ana#7731"],
+          "@ completes name#tag")
+    let tg = Server(retention: 3600)
+    var tgIn: [Int: [Msg]] = [:]
+    for id in 1...3 { tg.add(id, send: { tgIn[id, default: []].append($0) }, close: {}) }
+    tg.handle(1, Msg(t: "hello", from: "ana", tag: tagA))
+    tg.handle(2, Msg(t: "hello", from: "ana", tag: tagB))
+    tg.handle(3, Msg(t: "hello", from: "bo"))
+    check(tgIn[1]?.first { $0.t == "you" }?.from == "ana#\(tagA)" && tgIn[2]?.first { $0.t == "you" }?.from == "ana#\(tagB)" && tgIn[3]?.first { $0.t == "you" }?.from == "bo",
+          "the host shows each Mac's own tag; an older Psst sends none")
+    tg.handle(3, Msg(t: "ping", text: "ana"))
+    check(tgIn[3]?.last { $0.t == "note" }?.text?.hasPrefix("which one? ") == true && tgIn[1]?.contains { $0.t == "ping" } != true, "a shared name asks which one")
+    tg.handle(3, Msg(t: "ping", text: "ana#\(tagB)"))
+    check(tgIn[2]?.contains { $0.t == "ping" } == true && tgIn[1]?.contains { $0.t == "ping" } != true, "name#tag reaches the one")
+    tg.handle(1, Msg(t: "ping", text: "ana"))
+    check(tgIn[2]?.filter { $0.t == "ping" }.count == 2 && tgIn[1]?.last { $0.t == "note" }?.text == "pinged ana#\(tagB)", "ana pinging ana means the other one")
+    check(commandName("room") == "/room" && commandName("/R") == "/room" && commandName("m") == "/messages" && commandName("nope") == nil,
+          "/help [command] opens the help page at that command, short forms too")
+    check(Set(helpGroups.flatMap(\.names)) == Set(commands.map(\.name)) && helpGroups.flatMap(\.names).count == commands.count
+          && commands.allSatisfy { commandDetails[$0.name] != nil } && commandDetails.count == commands.count, "the help page explains every command once")
+    check(listMenu("/help") == nil && suggest("/help ", Ctx()).count == commands.count
           && suggest("/help me", Ctx()).map { "\($0.label)|\($0.replace)|\($0.run)" } == ["/messages [on|off]|/help messages|true"], "/help lists commands; picking one explains it")
     check(usage(commands[0]) == "/online [username]", "parameters in square brackets")
     check(hint("/inv").first?.replace == "/invite ", "command completes with room for its argument")
@@ -155,12 +186,12 @@ func selftest() {
     check(suggest("/room ", Ctx(joined: ["public", "club"])).map(\.label) == ["create", "member"]
           && paramGuide("/room ", Ctx(joined: ["public", "club"]))?.label == "/room [create|member]*", "in public: no editing offered")
     check(paramGuide("/room set name x", Ctx(joined: ["public"]))?.help == "#public can't be changed: name a room you're in", "no changing #public")
-    check(createArgs("chess 2 after school") == ("chess", "after school", 2) && createArgs("Chess") == ("chess", "", 0)
+    check(createArgs("chess 2 on weekends") == ("chess", "on weekends", 2) && createArgs("Chess") == ("chess", "", 0)
           && createArgs("chess \"3 people\"") == ("chess", "3 people", 0) && createArgs("chess 3") == ("chess", "", 3)
-          && createArgs("chess 9 lives") == ("chess", "9 lives", 0) && createArgs("chess after school 2") == ("chess", "after school 2", 0),
+          && createArgs("chess 9 lives") == ("chess", "9 lives", 0) && createArgs("chess on weekends 2") == ("chess", "on weekends 2", 0),
           "create: a second word 0–3 is the type")
     let ed = { (a: String) in roomEdit(a, current: "art").map { "\($0.room)|\($0.field)|\($0.value)" } ?? "nil" }
-    check(ed("set name lounge") == "art|name|lounge" && ed("club set desc after school") == "club|desc|after school"
+    check(ed("set name lounge") == "art|name|lounge" && ed("club set desc on weekends") == "club|desc|on weekends"
           && ed("Current set TYPE 2") == "art|type|2" && ed("club lounge") == "nil" && ed("set") == "art||", "set: room name optional, current is this room")
     let own = Ctx(me: "me", room: "club", roster: ["me", "zoe", "al"], joined: ["public", "club"], members: ["me", "zoe"], owner: "me", bans: ["al"])
     let zoes = Ctx(me: "me", room: "club", roster: ["me", "zoe"], members: ["me", "zoe"], owner: "zoe")

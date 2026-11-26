@@ -95,6 +95,8 @@ extension App {
     /// Remembers keys; warns once when someone's key differs from the one first seen for that name.
     func learn(_ keys: [String: String]) {
         for (n, k) in keys {
+            let plain = splitTag(n).name
+            if plain != n, pins[plain] == k { adopt(plain, as: n) }  // saved before tags: the same key, so the same person
             known[n] = k
             var p = pins
             if pinned(&p, n, k) { pins = p; changed[n] = nil; continue }
@@ -103,6 +105,17 @@ extension App {
                 show("⚠️ \(n)'s key changed: a new Mac, or someone in the middle. Compare /key \(n) in person, then /trust \(n). Until then they can't read your private-room messages.")
             }
         }
+    }
+
+    /// Moves what this Mac kept under someone's plain name (friend, block, nickname, key) to their name#tag.
+    func adopt(_ old: String, as new: String) {
+        var p = pins
+        p[new] = p.removeValue(forKey: old)
+        pins = p
+        if friends.contains(old) { friends = friends.map { $0 == old ? new : $0 } }
+        if blocked.contains(old) { blocked = blocked.map { $0 == old ? new : $0 } }
+        if let alias = friendNames[old] { friendNames[old] = nil; friendNames[new] = alias }
+        everSeen.removeAll { $0 == old }
     }
 
     func ad(_ r: NWBrowser.Result) -> HostAd? {  // nil: an older Psst, not part of the election
@@ -203,7 +216,7 @@ extension App {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.connect() }
         }
         l.send(Msg(t: "hello", from: name, ts: lastSeen, hidden: myStatus == 2, dnd: myStatus == 1, noPings: !d.bool(forKey: "pings"), key: publicKey(identity),
-                   since: server?.since, pic: myPic))
+                   since: server?.since, pic: myPic, tag: myTag))
     }
 
     /// Every Mac hosts (see electHost). Restarting makes this one the newest host, e.g. after sleeping.
