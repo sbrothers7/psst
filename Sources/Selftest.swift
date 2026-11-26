@@ -89,6 +89,14 @@ func selftest() {
     s.handle(3, Msg(t: "nick", from: "bob"))
     s.handle(2, Msg(t: "nick", from: "ana2"))
     check(s.clients[3]?.name == "bob" && s.clients[3]?.dnd == false && s.clients[2]?.noPings == false, "back to normal")
+    check(friendAlias("  Best   Friend!! ") == "Best Friend" && friendAlias("   ") == "" && friendAlias(String(repeating: "x", count: 30)).count == 20,
+          "friend nicknames: tidy, short")
+    let pals = Ctx(me: "me", roster: ["ana", "me"], friends: ["ana", "bo"], aliases: ["ana": "Bestie"])
+    check(suggest("/friend rename ", pals).map { "\($0.label)|\($0.detail)|\($0.replace)|\($0.run)" } == ["ana|Bestie|/friend rename ana |false", "bo||/friend rename bo |false"],
+          "rename lists friends, then waits for the nickname")
+    check(suggest("/online ", pals).first?.label == "Bestie · ana", "lists show my nickname for a friend")
+    check(actions("ana", pals).contains { $0.replace == "/friend rename ana " && !$0.run } && !actions("zed", Ctx(roster: ["zed"])).contains { $0.replace.hasPrefix("/friend rename") },
+          "friends get a nickname action")
     check(statusArg("1") == 1 && statusArg("DND") == 1 && statusArg("invisible") == 2 && statusArg("online") == 0 && statusArg("7") == nil, "status words and numbers")
 
     let e = emojify(":fire: :+1: :Grinning: :heart: :greek_small_letter_pi: 10:30:45 :nope: a:b")
@@ -102,7 +110,7 @@ func selftest() {
     check(hint("/join m", [], ["math", "public"]).map(\.replace) == ["/join math"], "/join suggests rooms")
     check(hint("/room create ma").isEmpty, "free argument has nothing to pick")
     check(paramGuide("/room create ma")?.label == "/room create [room name]* [type] [desc]" && paramGuide("/room create ma")?.focus == "[room name]", "guide shows format")
-    check(usage(commands.first { $0.name == "/trust" }!) == "/trust [username]*" && paramGuide("/friend ")?.label == "/friend [list|add|remove]* [username]",
+    check(usage(commands.first { $0.name == "/trust" }!) == "/trust [username]*" && paramGuide("/friend ")?.label == "/friend [list|add|remove|rename]* [username] [nickname]",
           "a star marks required parameters")
     let rc = Ctx(room: "art", joined: ["public", "art", "club"], open: ["art": 1, "club": 2], types: ["club": 2])
     let g = { (t: String) in paramGuide(t, rc).map { "\($0.label) | \($0.focus) | \($0.help)" } ?? "nil" }
@@ -169,12 +177,12 @@ func selftest() {
     check(emptyPair("**", at: 1) && emptyPair("a ``", at: 3) && !emptyPair("*a*", at: 2) && !emptyPair("*", at: 1) && !emptyPair("/x **", at: 4), "backspace empties a pair")
     check(suggest("#q?", Ctx(asks: ["#q?": [Suggestion(label: "1", replace: "x", run: true)]])).map(\.replace) == ["x"], "a question's answers")
     check(unquote(" \"chess club\" ") == "chess club" && unquote("“quiet”") == "quiet" && unquote("plain words") == "plain words", "quotes optional")
-    check(paramGuide("/friend a")?.focus == "[list|add|remove]", "guide highlights first parameter")
+    check(paramGuide("/friend a")?.focus == "[list|add|remove|rename]", "guide highlights first parameter")
     check(paramGuide("/friend add b")?.focus == "[username]", "guide moves to second parameter")
     check(paramGuide("/quit ") == nil && paramGuide("/fri") == nil && paramGuide("hi") == nil, "no guide without parameters")
     check(hint("hi :fir").first?.replace == "hi 🔥", "emoji suggestions: \(hint("hi :fir").map(\.label))")
     check(hint("at 10:30").isEmpty && hint("a :x").isEmpty, "no emoji guide for times or 1 letter")
-    check(hint("/friend ").map(\.replace) == ["/friend list ", "/friend add ", "/friend remove "], "/friend shows subcommands")
+    check(hint("/friend ").map(\.replace) == ["/friend list ", "/friend add ", "/friend remove ", "/friend rename "], "/friend shows subcommands")
     check(suggest("/friend add b", Ctx(roster: ["bo", "bea"], friends: ["bo"])).map(\.replace) == ["/friend add bea"],
           "/friend add suggests people not yet friends")
     check(suggest("/friend remove ", Ctx(friends: ["bo"])).map(\.replace) == ["/friend remove bo"], "/friend remove suggests friends")
@@ -588,6 +596,8 @@ func selftest() {
           "update signed by another key rejected")
     let tcpOpts = tcp().defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options
     check(tcpOpts?.enableKeepalive == true && tcp().includePeerToPeer, "keepalive notices dead links; peer-to-peer stays on")
+    check(onlyWiFi([["awdl0"], ["llw0", "awdl0"]]) && !onlyWiFi([["awdl0", "en0"], ["awdl0"]]) && !onlyWiFi([]),
+          "other Macs found only over peer-to-peer Wi-Fi: the network keeps Macs apart; none found: can't tell")
     check(NWTXTRecord(["id": "x", "since": "12.5"])["since"].flatMap(Double.init) == 12.5, "host start time survives the TXT record")
     check(tagVersion(URL(string: "https://github.com/sbrothers7/psst/releases/tag/v1.4.0")) == "1.4.0"
           && tagVersion(URL(string: "https://github.com/sbrothers7/psst/releases")) == nil && tagVersion(nil) == nil, "version from the latest release's tag")

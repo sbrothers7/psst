@@ -14,9 +14,10 @@ let commands: [(name: String, args: [String], help: String)] = [  // help fits o
     ("/invite", ["username*"], "invite someone to this room · /i"),
     ("/leave", ["silent"], "leave this room; silent: without telling it"),
     ("/nick", ["nickname"], "set your name in this room (blank to clear)"),
-    ("/friend", ["list|add|remove*", "username"], "manage friends"),
+    ("/friend", ["list|add|remove|rename*", "username", "nickname"], "manage friends; rename: a name only you see"),
     ("/block", ["username"], "block or unblock (blank to list)"),
     ("/history", ["on|off"], "on: keep messages and scroll back; off: they fade"),
+    ("/messages", ["on|off"], "off: stay online, but receive nothing new"),
     ("/settings", [], "open settings"),
     ("/key", ["username"], "key code to compare in person"),
     ("/trust", ["username*"], "trust someone's new key"),
@@ -195,6 +196,7 @@ struct Ctx {
     var asks: [String: [Suggestion]] = [:]                 // questions Psst asked (a menu's title -> its answers)
     var owner = "", bans: [String] = []                    // this room's creator (who can kick and ban) and who is banned
     var status = 0, busy: [String] = []                    // mine (see statusNames), and who is in do not disturb
+    var aliases: [String: String] = [:]                    // friend -> the nickname I gave them
 }
 
 /// What you can do to someone, after picking them from a list.
@@ -203,6 +205,7 @@ func actions(_ n: String, _ c: Ctx) -> [Suggestion] {
     guard c.roster.contains(n) || c.friends.contains(n) || c.members.contains(n) else { return [] }
     var a = [c.friends.contains(n) ? Suggestion(label: "remove friend", replace: "/friend remove \(n)", run: true)
                                    : Suggestion(label: "add friend", replace: "/friend add \(n)", run: true)]
+    if c.friends.contains(n) { a.append(Suggestion(label: c.aliases[n] == nil ? "give a nickname" : "change nickname", replace: "/friend rename \(n) ")) }
     if c.room != "public", c.roster.contains(n), !c.members.contains(n) {
         a.append(Suggestion(label: "invite to #\(c.room)", replace: "/invite \(n)", run: true))
     }
@@ -255,7 +258,7 @@ func suggest(_ text: String, _ c: Ctx) -> [Suggestion] {
         func plain(_ options: [String]) -> [Suggestion] { options.filter(fits).map { Suggestion(label: $0, replace: base + $0, run: true) } }
         func people(_ names: [String], inRoom: Bool = false, tag: Bool = true) -> [Suggestion] {  // picking one opens actions
             names.filter(fits).map { n in
-                Suggestion(label: (inRoom ? c.nicks[n].map { "\($0) · " } ?? "" : "") + n,
+                Suggestion(label: ((c.aliases[n] ?? (inRoom ? c.nicks[n] : nil)).map { "\($0) · " } ?? "") + n,
                            detail: ([n == c.me ? "you" : tag && c.friends.contains(n) ? "friend" : ""] + (c.busy.contains(n) ? ["do not disturb"] : []))
                                .filter { !$0.isEmpty }.joined(separator: " · "),
                            replace: base, dot: inRoom || c.roster.contains(n), sub: actions(n, c))  // replace: the list it's in
@@ -324,9 +327,11 @@ func suggest(_ text: String, _ c: Ctx) -> [Suggestion] {
         case ("/key", 1): return plain(others)
         case ("/ping", 1): return plain(others)
         case ("/trust", 1): return plain(c.changed)
-        case ("/history", 1): return plain(["on", "off"])
+        case ("/history", 1), ("/messages", 1): return plain(["on", "off"])
         case ("/leave", 1): return plain(["silent"])
-        case ("/friend", 1): return plain(["list ", "add ", "remove "])
+        case ("/friend", 1): return plain(["list ", "add ", "remove ", "rename "])
+        case ("/friend", 2) where words[0] == "rename":  // then type the nickname
+            return c.friends.filter(fits).map { Suggestion(label: $0, detail: c.aliases[$0] ?? "", replace: base + $0 + " ") }
         case ("/friend", 2) where words[0] == "list":
             return people(c.friends.filter(c.roster.contains) + c.friends.filter { !c.roster.contains($0) }, tag: false)
         case ("/friend", 2) where words[0] == "add": return plain(others.filter { !c.friends.contains($0) })

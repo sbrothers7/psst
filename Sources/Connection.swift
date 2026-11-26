@@ -64,16 +64,18 @@ extension App {
             let policy = d.string(forKey: "invites")
             guard policy == "everyone" || (policy == "friends" && friends.contains(from)) else { return }
             invited.insert(r)
-            show("\(from) invited you to #\(r). /join \(r)")
+            show("\(shown(from)) invited you to #\(r). /join \(r)")
         case "note": show(tag + (m.text ?? ""), dim: true)
         case "typing": gotTyping(m)
         case "ping":
             guard myStatus != 1, d.bool(forKey: "pings") else { break }  // the host checks too; an older one doesn't
-            flashEdges()
-            show("\(from) pinged you", dim: true)
+            let text = "\(shown(from)) pinged you"
+            flashEdges(text)
+            show(text, dim: true)
         case "say":
             lastSeen = max(lastSeen, m.ts ?? 0)
             if typers.removeValue(forKey: "\(r) \(from)") != nil { showTyping() }
+            guard d.bool(forKey: "receive") || from == me else { return }  // /messages off: online, but nothing new shows
             guard seen.insert("\(m.ts ?? 0) \(from)").inserted else { return }  // replays repeat what's on screen
             var text = m.text ?? ""
             if r != "public" {  // private: must open with the sender's trusted key, or it isn't shown

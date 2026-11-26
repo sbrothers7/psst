@@ -18,9 +18,9 @@ extension App {
     }
 
     func gotTyping(_ m: Msg) {
-        guard d.bool(forKey: "typing"), let from = m.from, from != me, !blocked.contains(from) else { return }
+        guard d.bool(forKey: "typing"), d.bool(forKey: "receive"), let from = m.from, from != me, !blocked.contains(from) else { return }
         let r = m.room ?? "public"
-        typers["\(r) \(from)"] = ((m.nick ?? from) + (r == "public" ? "" : " in #\(r)"), Date() + 5)
+        typers["\(r) \(from)"] = ((friendNames[from] ?? m.nick ?? from) + (r == "public" ? "" : " in #\(r)"), Date() + 5)
         showTyping()
         DispatchQueue.main.asyncAfter(deadline: .now() + 5.1) { [weak self] in self?.showTyping() }
     }

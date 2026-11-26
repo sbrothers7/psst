@@ -24,10 +24,12 @@ Psst updates itself daily by default. The interval can be changed or updates tur
 
 - Type `/` for commands. Full list: [commands.md](commands.md).
 - Macs running Psst find each other automatically, over the network or directly over Wi-Fi. Macs out of range connect through nearby ones.
+- A yellow dot on the menu bar icon means the network (or a VPN) blocks Macs from reaching each other. Psst then uses Wi-Fi directly, which reaches only Macs within about 30 m.
 - One Mac hosts. If it quits, the next one takes over with rooms and recent messages intact.
 - Messages fade after a few seconds. `/history on` keeps them.
 - Swearing and NSFW words are hidden in messages by default and not allowed in usernames.
 - Typing indicators, mention sounds, pings and which side messages appear on can be changed in Settings.
+- `/messages off` stops new messages while you stay online. `/friend rename` gives a friend a name only you see.
 - Drag a message to move the overlay. Right-click to lock its position.
 
 ## Privacy

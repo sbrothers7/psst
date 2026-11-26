@@ -54,6 +54,8 @@ extension App {
         updateBox.action = #selector(updateBoxChanged)
         filterBox.target = self
         filterBox.action = #selector(filterChanged)
+        receiveBox.target = self
+        receiveBox.action = #selector(receiveChanged)
         pingsBox.target = self
         pingsBox.action = #selector(pingsChanged)
         mentionBox.target = self
@@ -101,6 +103,7 @@ extension App {
             [label("Messages fade after"), popups[2]],
             [label("My messages"), popups[7]],
             [label("Others' messages"), popups[8]],
+            [none, receiveBox],
             [none, filterBox],
             [none, typingBox],
             [none, mentionBox],
@@ -195,7 +198,7 @@ extension App {
         }
         let rows: [[NSView]] = list.isEmpty ? [[small("People show up here once they open Psst on this network.")]]
             : [[small("Name"), small("Friend"), small("Blocked")]] + list.map { who in
-                let t = NSMutableAttributedString(string: who, attributes: [.font: NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor.labelColor])
+                let t = NSMutableAttributedString(string: listed(who), attributes: [.font: NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor.labelColor])
                 let on = online.contains(who)
                 t.append(NSAttributedString(string: on ? "  ●" : "  ○", attributes: [.font: NSFont.systemFont(ofSize: 11),
                     .foregroundColor: on ? NSColor.systemGreen : NSColor.tertiaryLabelColor]))
@@ -273,6 +276,7 @@ extension App {
         typingBox.state = d.bool(forKey: "typing") ? .on : .off
         mentionBox.state = d.bool(forKey: "mentionSound") ? .on : .off
         pingsBox.state = d.bool(forKey: "pings") ? .on : .off
+        receiveBox.state = d.bool(forKey: "receive") ? .on : .off
         updateBox.state = d.bool(forKey: "autoUpdate") ? .on : .off
         setUpdateState(updateState)
         popups[6].isEnabled = updateBox.state == .on
@@ -454,18 +458,36 @@ extension App {
         case ("list", _):
             let online = friends.filter(roster.contains)
             return friends.isEmpty ? "no friends yet: /friend add [username]"
-                : online.isEmpty ? "no friends online" : "friends online: " + online.joined(separator: ", ")
+                : online.isEmpty ? "no friends online" : "friends online: " + online.map(listed).joined(separator: ", ")
         case ("add", false):
             guard who != me, who != name else { return "that's you" }
             if !friends.contains(who) { friends.append(who) }
             return "added \(who) to friends" + (roster.contains(who) ? " (online now)" : "")
         case ("remove", false):
             friends.removeAll { $0 == who }
+            friendNames[who] = nil
             return "removed \(who) from friends"
+        case ("rename", false):  // a nickname only this Mac shows; none clears it
+            guard friends.contains(who) else { return "only friends get nicknames: /friend add \(who)" }
+            let alias = friendAlias(w.dropFirst(2).joined(separator: " "))
+            friendNames[who] = alias.isEmpty ? nil : alias
+            if settings?.isVisible == true { refreshPeople() }
+            return alias.isEmpty ? "\(who) shows as \(who) again" : "\(who) shows as \(alias), on this Mac only"
         default:
-            return "/friend list · /friend add [username] · /friend remove [username]"
+            return "/friend list · /friend add [username] · /friend remove [username] · /friend rename [username] [nickname]"
         }
     }
+
+    /// /messages, the menu and Settings: off keeps you online, but new messages and typing aren't shown.
+    func setReceive(_ on: Bool) {
+        d.set(on, forKey: "receive")
+        receiveBox.state = on ? .on : .off
+        if !on { typers = [:]; showTyping() }
+        show(on ? "receiving messages again" : "messages off: you stay online, but nothing new shows. /messages on to resume", dim: true)
+    }
+
+    @objc func toggleReceive() { setReceive(!d.bool(forKey: "receive")) }
+    @objc func receiveChanged() { setReceive(receiveBox.state == .on) }
 
     @objc func invite(_ i: NSMenuItem) { line?.send(Msg(t: "invite", room: room, text: i.representedObject as? String)) }
 }

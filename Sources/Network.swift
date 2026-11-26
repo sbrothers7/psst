@@ -21,6 +21,14 @@ func tcp() -> NWParameters {
     return p
 }
 
+/// True when every other Mac is found only over peer-to-peer Wi-Fi (awdl/llw links), never over the network:
+/// the network keeps Macs apart (client isolation, or a VPN that captures local traffic), so Psst reaches only
+/// Macs within ~30 m. `links`: interface names each other Mac was found on. No other Mac found: can't tell, false.
+// ponytail: a VPN that passes Bonjour but drops the connections themselves goes unnoticed.
+func onlyWiFi(_ links: [[String]]) -> Bool {
+    !links.isEmpty && links.allSatisfy { $0.allSatisfy { $0.hasPrefix("awdl") || $0.hasPrefix("llw") } }
+}
+
 // MARK: - Hosting: every Mac hosts, everyone shares the oldest
 //
 // Every Mac runs a host and advertises it. All Macs join the same one, the longest-running host still reachable,

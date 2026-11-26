@@ -26,6 +26,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     var prevRoom = "public", lastSeen = 0.0  // to pick up where we were after reconnecting
     var me = "", room = "public", via = "", roster: [String] = [], rooms: Set<String> = [], invited: Set<String> = []
     let status = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+    let wifiDot = Dot()  // yellow, on the menu bar icon: only peer-to-peer Wi-Fi reaches other Macs (see onlyWiFi)
+    var onWiFi: Bool { onlyWiFi(hosts.filter { ad($0)?.id != server?.id }.map { $0.interfaces.map(\.name) }) }
     let stack = NSStackView(), field = NSTextField(), hintLabel = NSTextField(wrappingLabelWithString: "")
     let feedDoc = Flipped()
     var seen = Set<String>()  // messages already shown (time + sender), so a replay never repeats one
@@ -50,6 +52,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     let typingBox = NSButton(checkboxWithTitle: "Show typing indicators, and share mine", target: nil, action: nil)
     let mentionBox = NSButton(checkboxWithTitle: "Play a sound when someone @mentions me", target: nil, action: nil)
     let pingsBox = NSButton(checkboxWithTitle: "Let people ping me (flashes my screen edges)", target: nil, action: nil)
+    let receiveBox = NSButton(checkboxWithTitle: "Receive messages (off: stay online, see nothing new)", target: nil, action: nil)
     let saveButton = NSButton(title: "Save", target: nil, action: nil)
     let shortcutButton = NSButton(title: "", target: nil, action: nil)
     var recorder: Any?  // key monitor while a new shortcut is being typed
@@ -62,6 +65,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         get { d.stringArray(forKey: "friends") ?? [] }
         set { d.set(newValue, forKey: "friends") }
     }
+    var friendNames: [String: String] {  // friend -> the nickname I gave them, seen only on this Mac
+        get { d.dictionary(forKey: "friendNames") as? [String: String] ?? [:] }
+        set { d.set(newValue, forKey: "friendNames") }
+    }
+    func shown(_ n: String) -> String { friendNames[n] ?? n }  // above their messages
+    func listed(_ n: String) -> String { friendNames[n].map { "\($0) (\(n))" } ?? n }  // in lists, with the username
     lazy var identity = loadIdentity()
     lazy var pairing: PairingEditor = { let e = PairingEditor(); e.isFieldEditor = true; return e }()
     var typers: [String: (label: String, until: Date)] = [:]  // "room name" -> who's typing there, until when
@@ -94,7 +103,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     func applicationDidFinishLaunching(_ n: Notification) {
         let f = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 800, height: 600)
         if d.bool(forKey: "invisible") { d.set(2, forKey: "status"); d.removeObject(forKey: "invisible") }  // Psst 1.0 kept a bool
-        d.register(defaults: ["cooldown": 10.0, "retention": 600.0, "status": 0, "pings": true, "invites": "everyone",
+        d.register(defaults: ["cooldown": 10.0, "retention": 600.0, "status": 0, "pings": true, "receive": true, "invites": "everyone",
                               "color": "auto", "picKind": "none", "history": false, "filter": true, "typing": true, "mentionSound": true, "alignMine": "left", "alignOthers": "left", "autoUpdate": true, "updateEvery": 86400.0, "hotKeyCode": kVK_Space, "hotKeyMods": optionKey, "hotKeyLabel": "⌥Space",
                               "x": f.minX + 12, "y": f.minY + 12])
         buildUI()
@@ -111,6 +120,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         b.browseResultsChangedHandler = { [weak self] results, _ in
             guard let self else { return }
             self.hosts = Array(results)
+            self.wifiDot.isHidden = !self.onWiFi
             self.regroup()
         }
         b.start(queue: .main)
@@ -121,6 +131,17 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     func buildUI() {
         status.button?.image = NSImage(systemSymbolName: "bubble.left", accessibilityDescription: "Psst")
         status.button?.appearsDisabled = true
+        if let b = status.button {
+            wifiDot.isHidden = true
+            wifiDot.wantsLayer = true
+            wifiDot.layer?.backgroundColor = NSColor.systemYellow.cgColor
+            wifiDot.layer?.cornerRadius = 3.5
+            wifiDot.translatesAutoresizingMaskIntoConstraints = false
+            b.addSubview(wifiDot)
+            NSLayoutConstraint.activate([wifiDot.widthAnchor.constraint(equalToConstant: 7), wifiDot.heightAnchor.constraint(equalToConstant: 7),
+                                         wifiDot.trailingAnchor.constraint(equalTo: b.trailingAnchor, constant: -1),
+                                         wifiDot.bottomAnchor.constraint(equalTo: b.bottomAnchor, constant: -2)])
+        }
         let menu = NSMenu()
         menu.delegate = self
         status.menu = menu
@@ -275,7 +296,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         col.alignment = right ? .trailing : .leading
         col.spacing = 2
         let head = NSMutableAttributedString()
-        if !mine { head.append(NSAttributedString(string: m.nick ?? from, attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .semibold), .foregroundColor: nameColor(from, m.color)])) }
+        if !mine { head.append(NSAttributedString(string: friendNames[from] ?? m.nick ?? from, attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .semibold), .foregroundColor: nameColor(from, m.color)])) }
         if r != "public" { head.append(NSAttributedString(string: (mine ? "" : " · ") + "#" + r, attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor])) }
         if head.length > 0 { col.addArrangedSubview(NSTextField(labelWithAttributedString: head)) }
         col.addArrangedSubview(bubble(text, tint: mine))
@@ -399,13 +420,17 @@ extension App {
             add("Reset position", #selector(resetPosition))
             return
         }
+        let wifi = onWiFi
+        if wifi { add("Network Access Blocked: Psst is using Wi-Fi (decreased range)") }
         add(me.isEmpty ? "Looking for other machines…" : "\(me) in #\(room) · \(via)")
         add("Write…   \(shortcut)", #selector(toggleInput))
+        add("Receive messages", #selector(toggleReceive), on: d.bool(forKey: "receive"))
         menu.addItem(.separator())
 
-        add(room == "public" ? "Online (/online for options)" : "Online: click to invite to #\(room)")
-        for n in roster where n != me {
-            add((friends.contains(n) ? "★ " : "") + n, room == "public" ? nil : #selector(invite(_:)), n, indent: true)
+        let others = roster.filter { $0 != me }
+        add((wifi ? "Online (discovered)" : "Online") + " · \(others.count)" + (room == "public" ? "" : ": click to invite to #\(room)"))
+        for n in others {
+            add((friends.contains(n) ? "★ " : "") + listed(n), room == "public" ? nil : #selector(invite(_:)), n, indent: true)
         }
         menu.addItem(.separator())
 

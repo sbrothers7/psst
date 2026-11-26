@@ -1,5 +1,8 @@
 import AppKit
 
+/// A view that lets clicks through to what's under it (the menu bar icon's dot).
+final class Dot: NSView { override func hitTest(_ point: NSPoint) -> NSView? { nil } }
+
 // MARK: - Overlay
 
 final class Panel: NSPanel {
@@ -65,8 +68,9 @@ func pill(_ content: NSView) -> Bubble {
     return v
 }
 
-/// /ping: the edges of every screen glow in the accent color, three times. Click-through, over everything.
-func flashEdges() {
+/// /ping: the edges of every screen glow in the accent color, three times, with who pinged at the top.
+/// Click-through, over everything.
+func flashEdges(_ text: String) {
     for screen in NSScreen.screens {
         let w = NSWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
         w.isReleasedWhenClosed = false
@@ -75,11 +79,7 @@ func flashEdges() {
         w.ignoresMouseEvents = true
         w.level = .screenSaver
         w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-        let v = NSView()
-        v.wantsLayer = true
-        v.layer?.borderWidth = 8
-        v.layer?.borderColor = NSColor.controlAccentColor.cgColor
-        w.contentView = v
+        w.contentView = pingView(text, top: screen.frame.maxY - screen.visibleFrame.maxY + 16)  // below the menu bar
         w.alphaValue = 0
         w.orderFrontRegardless()
         func pulse(_ left: Int) {
@@ -89,4 +89,29 @@ func flashEdges() {
         }
         pulse(3)
     }
+}
+
+/// The accent border and, `top` points down, a tag saying who pinged.
+func pingView(_ text: String, top: CGFloat) -> NSView {
+    let v = NSView(), tag = NSView(), label = NSTextField(labelWithString: text)
+    v.wantsLayer = true
+    v.layer?.borderWidth = 8
+    v.layer?.borderColor = NSColor.controlAccentColor.cgColor
+    tag.wantsLayer = true
+    tag.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
+    tag.layer?.cornerRadius = 12
+    label.font = .boldSystemFont(ofSize: 22)
+    label.textColor = .white
+    for x in [tag, label] { x.translatesAutoresizingMaskIntoConstraints = false }
+    tag.addSubview(label)
+    v.addSubview(tag)
+    NSLayoutConstraint.activate([
+        label.leadingAnchor.constraint(equalTo: tag.leadingAnchor, constant: 18),
+        label.trailingAnchor.constraint(equalTo: tag.trailingAnchor, constant: -18),
+        label.topAnchor.constraint(equalTo: tag.topAnchor, constant: 8),
+        label.bottomAnchor.constraint(equalTo: tag.bottomAnchor, constant: -8),
+        tag.centerXAnchor.constraint(equalTo: v.centerXAnchor),
+        tag.topAnchor.constraint(equalTo: v.topAnchor, constant: top),
+    ])
+    return v
 }

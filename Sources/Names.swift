@@ -18,6 +18,12 @@ func nameProblem(_ n: String) -> String? {
 
 func validName(_ n: String) -> Bool { nameProblem(n) == nil }
 
+/// A nickname I give a friend, seen only on this Mac: letters, digits, spaces and - _ ' ., 20 at most.
+func friendAlias(_ raw: String) -> String {
+    let kept = raw.filter { $0.isLetter || $0.isNumber || " -_'.".contains($0) }
+    return String(kept.split(separator: " ").joined(separator: " ").prefix(20)).trimmingCharacters(in: .whitespaces)
+}
+
 /// A room password as sent: hashed, so the typed password never leaves this Mac. Not tied to the room's name,
 /// so it keeps working after /room rename.
 // ponytail: anyone watching the network can replay the hash to join; it keeps people out, not eavesdroppers.

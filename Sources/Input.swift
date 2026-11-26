@@ -100,7 +100,7 @@ extension App {
             joined: ["public"] + rooms.subtracting(["public"]).sorted(), invited: invited.sorted(), open: openRooms,
             members: room == "public" ? roster : (members[room] ?? [:]).keys.sorted(), nicks: nicks[room] ?? [:],
             requests: requests[room] ?? [], locked: locked.sorted(), descs: roomDescs, types: roomTypes, asks: asks,
-            owner: roomOwner[room] ?? "", bans: roomBans[room] ?? [], status: myStatus, busy: busy)
+            owner: roomOwner[room] ?? "", bans: roomBans[room] ?? [], status: myStatus, busy: busy, aliases: friendNames)
     }
 
     func updateHints() {
@@ -196,6 +196,7 @@ extension App {
             if on { line?.send(Msg(t: "history", room: room)) }  // what the host still has, slotted in by time
             return
         case "/friend": return note(friend(arg))
+        case "/messages": return setReceive(arg.isEmpty ? !d.bool(forKey: "receive") : arg.lowercased() == "on")
         case "/block":
             let who = clean(arg)
             if who.isEmpty { return note(blocked.isEmpty ? "no one blocked" : "blocked: " + blocked.joined(separator: ", ")) }
@@ -256,7 +257,7 @@ extension App {
         case "/status":
             guard let n = statusArg(arg) else { return note("you're \(statusNames[myStatus]). /status 0 online · 1 do not disturb · 2 invisible") }
             setStatus(n)
-        case "/online": note(arg.isEmpty ? "online: " + roster.joined(separator: ", ") : roster.contains(clean(arg)) ? "\(clean(arg)) is online" : "no one online named \(arg)")
+        case "/online": note(arg.isEmpty ? "online: " + roster.map(listed).joined(separator: ", ") : roster.contains(clean(arg)) ? "\(clean(arg)) is online" : "no one online named \(arg)")
         case _ where s.hasPrefix("/"): show(commands.map(usage).joined(separator: " · "), dim: true)
         default:
             let color = d.string(forKey: "color")

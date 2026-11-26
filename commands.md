@@ -8,11 +8,12 @@
 |---|---|
 | `/online [username]` | List online users, or check one |
 | `/status [0\|1\|2]` | Set your status: 0 online, 1 do not disturb (no pings or mention sounds), 2 invisible (not in the online list) |
-| `/ping [username]*` | Flash a user's screen edges. Once every 30 seconds |
-| `/friend [list\|add\|remove]* [username]` | Manage friends |
+| `/ping [username]*` | Flash a user's screen edges with your name. Once every 30 seconds |
+| `/friend [list\|add\|remove\|rename]* [username] [nickname]` | Manage friends. `rename` sets a name only you see; no nickname clears it |
 | `/block [username]` | Block or unblock a user. No argument lists blocked users |
 | `/nick [nickname]` | Set your nickname in the current room. No argument clears it |
 | `/history [on\|off]` | Keep messages with scrollback, or let them fade. No argument toggles |
+| `/messages [on\|off]` | Stop receiving messages while staying online, or resume. No argument toggles |
 | `/key [username]` | Show a key code for verification. No argument shows yours |
 | `/trust [username]*` | Accept a user's new key |
 | `/settings` | Open settings |
