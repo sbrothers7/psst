@@ -5,7 +5,7 @@ import AppKit
 let commands: [(name: String, args: [String], help: String)] = [  // help fits one line of the guide; * = required
     ("/online", ["username"], "see who is online"),
     ("/status", ["0|1|2"], "0 online · 1 do not disturb · 2 invisible"),
-    ("/ping", ["username*"], "flash their screen edges (once every 30 s)"),
+    ("/ping", ["username*"], "flash your name on their screen (once every 30 s)"),
     ("/room", ["create|set|member*"], "make a room, change one, or see who's in it · /r, /r c"),
     ("/browse", ["room name"], "browse rooms on the network"),
     ("/join", ["room name", "password"], "switch rooms, or join with an invite or password · /j"),
@@ -16,8 +16,9 @@ let commands: [(name: String, args: [String], help: String)] = [  // help fits o
     ("/nick", ["nickname"], "set your name in this room (blank to clear)"),
     ("/friend", ["list|add|remove|rename*", "username", "nickname"], "manage friends; rename: a name only you see"),
     ("/block", ["username"], "block or unblock (blank to list)"),
-    ("/history", ["on|off"], "on: keep messages and scroll back; off: they fade"),
-    ("/messages", ["on|off"], "off: stay online, but receive nothing new"),
+    ("/history", ["on|off"], "on (1): keep messages and scroll back; off (0): they fade"),
+    ("/messages", ["on|off"], "off (0): stay online, but receive nothing new · /m"),
+    ("/help", ["command"], "what a command does; blank lists them all"),
     ("/settings", [], "open settings"),
     ("/key", ["username"], "key code to compare in person"),
     ("/trust", ["username*"], "trust someone's new key"),
@@ -34,7 +35,10 @@ func statusArg(_ s: String) -> Int? {
 
 /// Short forms, expanded once a space follows: /r = /room, /r c = /room create, /i = /invite, /a = /accept, /j = /join,
 /// /rq = /request.
-let shortForms = ["/r": "/room", "/i": "/invite", "/a": "/accept", "/j": "/join", "/rq": "/request"]
+let shortForms = ["/r": "/room", "/i": "/invite", "/a": "/accept", "/j": "/join", "/rq": "/request", "/m": "/messages"]
+
+/// on/off, or 1/0; nil for anything else.
+func onOff(_ s: String) -> Bool? { ["on": true, "1": true, "off": false, "0": false][s.lowercased()] }
 
 func expand(_ text: String) -> String {
     var out = text
@@ -99,6 +103,12 @@ final class PairingEditor: NSTextView {
 }
 
 /// "/friend [list|add|remove]* [username]": one placeholder per parameter, written like the README; * = required.
+/// /help [command]: its format and what it does. Short forms work (/help r); nil when there's no such command.
+func commandHelp(_ name: String) -> String? {
+    let n = "/" + name.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
+    return commands.first { $0.name == (shortForms[n] ?? n) }.map { "\(usage($0)): \($0.help)" }
+}
+
 func usage(_ c: (name: String, args: [String], help: String)) -> String {
     ([c.name] + c.args.map(placeholder)).joined(separator: " ")
 }
@@ -180,7 +190,7 @@ func roomGuide(_ rest: String, _ c: Ctx) -> (label: String, focus: String, help:
 
 /// A row of the typing guide. Picking it: opens `sub` (a menu, typed text untouched), runs `replace` as a command (`run`),
 /// or puts `replace` in the field.
-struct Suggestion { var label: String, detail = "", replace: String, dot: Bool? = nil, run = false, sub: [Suggestion]? = nil }
+struct Suggestion { var label: String, detail = "", replace: String, dot: Bool? = nil, run = false, sub: [Suggestion]? = nil, busy = false }  // busy: red dot
 
 /// What the typing guide knows: the network as this Mac sees it.
 struct Ctx {
@@ -222,7 +232,7 @@ func actions(_ n: String, _ c: Ctx) -> [Suggestion] {
 /// Commands that, sent bare, open their list as a menu to pick from. The value is the typed text that lists it.
 func listMenu(_ s: String) -> String? {
     let c = s.lowercased().split(separator: " ").joined(separator: " ")
-    let lists = ["/online", "/status", "/ping", "/room", "/browse", "/join", "/request", "/invite", "/block", "/friend list", "/friend add", "/friend remove",
+    let lists = ["/help", "/online", "/status", "/ping", "/room", "/browse", "/join", "/request", "/invite", "/block", "/friend list", "/friend add", "/friend remove",
                  "/room member list", "/room member kick", "/room member ban"]
     return c == "/friend" ? "/friend list " : c == "/room member" ? "/room member list " : lists.contains(c) ? c + " " : nil
 }
@@ -258,10 +268,10 @@ func suggest(_ text: String, _ c: Ctx) -> [Suggestion] {
         func plain(_ options: [String]) -> [Suggestion] { options.filter(fits).map { Suggestion(label: $0, replace: base + $0, run: true) } }
         func people(_ names: [String], inRoom: Bool = false, tag: Bool = true) -> [Suggestion] {  // picking one opens actions
             names.filter(fits).map { n in
-                Suggestion(label: ((c.aliases[n] ?? (inRoom ? c.nicks[n] : nil)).map { "\($0) · " } ?? "") + n,
+                Suggestion(label: ((c.aliases[n] ?? (inRoom ? c.nicks[n] : nil)).map { "\($0) · " } ?? "") + n + (c.room != "public" && n == c.owner ? " ◆" : ""),
                            detail: ([n == c.me ? "you" : tag && c.friends.contains(n) ? "friend" : ""] + (c.busy.contains(n) ? ["do not disturb"] : []))
                                .filter { !$0.isEmpty }.joined(separator: " · "),
-                           replace: base, dot: inRoom || c.roster.contains(n), sub: actions(n, c))  // replace: the list it's in
+                           replace: base, dot: inRoom || c.roster.contains(n), sub: actions(n, c), busy: c.busy.contains(n))  // replace: the list it's in
             }
         }
         let others = c.roster.filter { $0 != c.me }
@@ -328,6 +338,9 @@ func suggest(_ text: String, _ c: Ctx) -> [Suggestion] {
         case ("/ping", 1): return plain(others)
         case ("/trust", 1): return plain(c.changed)
         case ("/history", 1), ("/messages", 1): return plain(["on", "off"])
+        case ("/help", 1):  // every command with its format; picking one explains it in the chat
+            return commands.filter { fits(String($0.name.dropFirst())) || fits($0.name) }
+                .map { Suggestion(label: usage($0), detail: $0.help, replace: "/help " + $0.name.dropFirst(), run: true) }
         case ("/leave", 1): return plain(["silent"])
         case ("/friend", 1): return plain(["list ", "add ", "remove ", "rename "])
         case ("/friend", 2) where words[0] == "rename":  // then type the nickname

@@ -296,7 +296,7 @@ final class Server {
             clients[t]?.send(Msg(t: "note", text: "\(c.name) \(did) you from #\(room)"))
             remove(t, from: room, note: "\(c.name) \(did) \(name) from #\(room)")
 
-        case "ping":  // flashes their screen edges
+        case "ping":  // flashes "ana has pinged you [in #room]" on their screens
             let name = clean(m.text ?? "")
             guard let target = clients.first(where: { $0.key != id && $0.value.ready && $0.value.name == name && !$0.value.hidden })
             else { return note(name == c.name ? "you can't ping yourself" : "no one named \(name)") }
@@ -305,7 +305,7 @@ final class Server {
             let now = Date().timeIntervalSince1970, wait = 30 - (now - (lastPing[c.name] ?? 0))
             guard wait <= 0 else { return note("you can ping again in \(Int(wait.rounded(.up))) s") }
             lastPing[c.name] = now
-            target.value.send(Msg(t: "ping", from: c.name))
+            target.value.send(Msg(t: "ping", room: room != "public" && c.rooms.contains(room) ? room : nil, from: c.name))
             note("pinged \(name)")
 
         case "typing":  // passed on, never kept; invisible people don't show up typing in public

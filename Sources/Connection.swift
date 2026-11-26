@@ -69,8 +69,8 @@ extension App {
         case "typing": gotTyping(m)
         case "ping":
             guard myStatus != 1, d.bool(forKey: "pings") else { break }  // the host checks too; an older one doesn't
-            let text = "\(shown(from)) pinged you"
-            flashEdges(text)
+            let text = "\(shown(from)) has pinged you" + (r == "public" ? "" : " in #\(r)")
+            flashPing(text)
             show(text, dim: true)
         case "say":
             lastSeen = max(lastSeen, m.ts ?? 0)
@@ -84,6 +84,7 @@ extension App {
                 text = opened
             }
             showMessage(m, text: markdown(d.bool(forKey: "filter") ? censor(text) : text))
+            if from != me, hints.isVisible { menu = nil; suggestions = []; hints.orderOut(nil) }  // don't cover it; typing brings the guide back
             if from != me, myStatus != 1, d.bool(forKey: "mentionSound"), mentions(text, [me] + [nicks[r]?[me]].compactMap { $0 }) {
                 NSSound(named: "Glass")?.play()
             }

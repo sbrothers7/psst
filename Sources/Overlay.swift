@@ -3,6 +3,12 @@ import AppKit
 /// A view that lets clicks through to what's under it (the menu bar icon's dot).
 final class Dot: NSView { override func hitTest(_ point: NSPoint) -> NSView? { nil } }
 
+/// The menu bar icon's dot, most urgent first: red not connected, yellow only peer-to-peer Wi-Fi reaches other Macs,
+/// blue an update is out. nil: no dot.
+func trayDotColor(connected: Bool, wifiOnly: Bool, update: Bool) -> NSColor? {
+    !connected ? .systemRed : wifiOnly ? .systemYellow : update ? .systemBlue : nil
+}
+
 // MARK: - Overlay
 
 final class Panel: NSPanel {
@@ -68,9 +74,8 @@ func pill(_ content: NSView) -> Bubble {
     return v
 }
 
-/// /ping: the edges of every screen glow in the accent color, three times, with who pinged at the top.
-/// Click-through, over everything.
-func flashEdges(_ text: String) {
+/// /ping: "ana has pinged you" pulses three times at the top of every screen. Click-through, over everything.
+func flashPing(_ text: String) {
     for screen in NSScreen.screens {
         let w = NSWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
         w.isReleasedWhenClosed = false
@@ -91,25 +96,22 @@ func flashEdges(_ text: String) {
     }
 }
 
-/// The accent border and, `top` points down, a tag saying who pinged.
+/// A tag saying who pinged, `top` points down, centered.
 func pingView(_ text: String, top: CGFloat) -> NSView {
     let v = NSView(), tag = NSView(), label = NSTextField(labelWithString: text)
-    v.wantsLayer = true
-    v.layer?.borderWidth = 8
-    v.layer?.borderColor = NSColor.controlAccentColor.cgColor
     tag.wantsLayer = true
     tag.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
-    tag.layer?.cornerRadius = 12
-    label.font = .boldSystemFont(ofSize: 22)
+    tag.layer?.cornerRadius = 9
+    label.font = .boldSystemFont(ofSize: 14)
     label.textColor = .white
     for x in [tag, label] { x.translatesAutoresizingMaskIntoConstraints = false }
     tag.addSubview(label)
     v.addSubview(tag)
     NSLayoutConstraint.activate([
-        label.leadingAnchor.constraint(equalTo: tag.leadingAnchor, constant: 18),
-        label.trailingAnchor.constraint(equalTo: tag.trailingAnchor, constant: -18),
-        label.topAnchor.constraint(equalTo: tag.topAnchor, constant: 8),
-        label.bottomAnchor.constraint(equalTo: tag.bottomAnchor, constant: -8),
+        label.leadingAnchor.constraint(equalTo: tag.leadingAnchor, constant: 12),
+        label.trailingAnchor.constraint(equalTo: tag.trailingAnchor, constant: -12),
+        label.topAnchor.constraint(equalTo: tag.topAnchor, constant: 5),
+        label.bottomAnchor.constraint(equalTo: tag.bottomAnchor, constant: -5),
         tag.centerXAnchor.constraint(equalTo: v.centerXAnchor),
         tag.topAnchor.constraint(equalTo: v.topAnchor, constant: top),
     ])

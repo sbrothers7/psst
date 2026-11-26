@@ -130,7 +130,7 @@ extension App {
         head.paragraphSpacing = 2
         if inMenu {  // the list's command, or the picked person or room; then the way out
             let line = NSMutableAttributedString(attributedString: styled(title?.label ?? menu!.source.trimmingCharacters(in: .whitespaces), bold: true))
-            if let on = title?.dot { line.append(styled(on ? " ●" : " ○", color: on ? .systemGreen : .tertiaryLabelColor)) }
+            if let on = title?.dot { line.append(styled(on ? " ●" : " ○", color: !on ? .tertiaryLabelColor : title!.busy ? .systemRed : .systemGreen)) }
             line.append(styled(title == nil ? "   esc to close" : "   esc to go back", dim: true))
             line.addAttribute(.paragraphStyle, value: head, range: NSRange(location: 0, length: line.length))
             s.append(line)
@@ -152,7 +152,7 @@ extension App {
         for (i, g) in page {
             if body.length > 0 || s.length > 0 { body.append(styled("\n")) }
             body.append(styled((i == pick ? "▸" : "") + "\t" + g.label, dim: i != pick, bold: i == pick))
-            if let on = g.dot { body.append(styled(on ? " ●" : " ○", color: on ? .systemGreen : .tertiaryLabelColor)) }
+            if let on = g.dot { body.append(styled(on ? " ●" : " ○", color: !on ? .tertiaryLabelColor : g.busy ? .systemRed : .systemGreen)) }  // red: do not disturb
             if !g.detail.isEmpty { body.append(styled("\t" + g.detail, dim: true)) }
             if i == pick, !inMenu, g.sub == nil, g.replace != typed { body.append(styled("  ⇥ tab", color: .tertiaryLabelColor)) }  // Tab completes
         }
@@ -190,13 +190,16 @@ extension App {
         switch parts[0] {  // these work without a host
         case "/quit": return NSApp.terminate(nil)
         case "/settings": return showSettings(welcome: false)
+        case "/help": return note(arg.isEmpty ? commands.map(usage).joined(separator: " · ") : commandHelp(arg) ?? "no command /\(arg.drop { $0 == "/" }). /help lists them all")
         case "/history":  // on: every message stays and the feed scrolls back; off: they fade. Bare: switch
-            let on = arg.isEmpty ? !history : arg.lowercased() == "on"
+            guard let on = arg.isEmpty ? !history : onOff(arg) else { return note("/history on (1) or off (0)") }
             setHistory(on)
             if on { line?.send(Msg(t: "history", room: room)) }  // what the host still has, slotted in by time
             return
         case "/friend": return note(friend(arg))
-        case "/messages": return setReceive(arg.isEmpty ? !d.bool(forKey: "receive") : arg.lowercased() == "on")
+        case "/messages":
+            guard let on = arg.isEmpty ? !d.bool(forKey: "receive") : onOff(arg) else { return note("/messages on (1) or off (0)") }
+            return setReceive(on)
         case "/block":
             let who = clean(arg)
             if who.isEmpty { return note(blocked.isEmpty ? "no one blocked" : "blocked: " + blocked.joined(separator: ", ")) }
@@ -252,13 +255,13 @@ extension App {
             line.send(Msg(t: "accept", room: requests[room]?.isEmpty == false ? room : lastAsked ?? room, text: arg))
         case "/nick": line.send(Msg(t: "alias", room: room, text: arg))
         case "/invite": line.send(Msg(t: "invite", room: room, text: arg))
-        case "/ping": line.send(Msg(t: "ping", text: arg))
+        case "/ping": line.send(Msg(t: "ping", room: room, text: arg))
         case "/leave": line.send(Msg(t: "leave", room: room, text: arg.lowercased() == "silent" ? "silent" : nil))
         case "/status":
             guard let n = statusArg(arg) else { return note("you're \(statusNames[myStatus]). /status 0 online · 1 do not disturb · 2 invisible") }
             setStatus(n)
         case "/online": note(arg.isEmpty ? "online: " + roster.map(listed).joined(separator: ", ") : roster.contains(clean(arg)) ? "\(clean(arg)) is online" : "no one online named \(arg)")
-        case _ where s.hasPrefix("/"): show(commands.map(usage).joined(separator: " · "), dim: true)
+        case _ where s.hasPrefix("/"): note("no command \(parts[0]). /help lists them all")
         default:
             let color = d.string(forKey: "color")
             guard room != "public" else { return line.send(Msg(t: "say", room: room, text: emojify(s), color: color)) }

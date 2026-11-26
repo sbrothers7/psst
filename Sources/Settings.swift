@@ -384,7 +384,7 @@ extension App {
         d.set(n, forKey: "status")
         sendProfile()
         if settings != nil { refreshSettings() }
-        show("you're \(statusNames[n])" + (n == 1 ? ": no pings or mention sounds" : n == 2 ? ": hidden from the online list" : ""), dim: true)
+        show("set to \(statusNames[n])", dim: true)
     }
 
     @objc func mentionChanged() { d.set(mentionBox.state == .on, forKey: "mentionSound") }

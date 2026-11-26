@@ -65,9 +65,11 @@ func selftest() {
 
     inbox = [:]
     s.handle(3, Msg(t: "ping", text: "ana"))
-    check(last(1)?.t == "ping" && last(1)?.from == "bob" && lastNote(3) == "pinged ana", "ping reaches them")
+    check(last(1)?.t == "ping" && last(1)?.from == "bob" && last(1)?.room == nil && lastNote(3) == "pinged ana", "ping reaches them")
     s.handle(3, Msg(t: "ping", text: "ana2"))
     check(inbox[2]?.contains { $0.t == "ping" } != true && lastNote(3)?.hasPrefix("you can ping again in") == true, "one ping per 30 s")
+    s.handle(2, Msg(t: "ping", room: "math", text: "ana"))
+    check(last(1)?.t == "ping" && last(1)?.from == "ana2" && last(1)?.room == "math", "a ping from a room says which")
     s.handle(1, Msg(t: "ping", text: "ghost"))
     s.handle(2, Msg(t: "ping", text: "ana2"))
     check(inbox[4]?.contains { $0.t == "ping" } != true && lastNote(1) == "no one named ghost" && inbox[2]?.contains { $0.t == "ping" } != true,
@@ -76,7 +78,8 @@ func selftest() {
           && !mentions("x@ana", ["ana"]) && !mentions("hey ana", ["ana"]) && !mentions("@ana", []), "mentions")
     check(expand("/r c math") == "/room create math" && expand("/R ") == "/room " && expand("/i ana") == "/invite ana" && expand("/a all") == "/accept all"
           && expand("/j art pw") == "/join art pw" && expand("/room c x") == "/room create x" && expand("/r") == "/r" && expand("/rooms x") == "/rooms x"
-          && expand("hi /r x") == "hi /r x" && expand("/rq art") == "/request art", "short commands")
+          && expand("hi /r x") == "hi /r x" && expand("/rq art") == "/request art" && expand("/m 0") == "/messages 0", "short commands")
+    check(onOff("ON") == true && onOff("1") == true && onOff("off") == false && onOff("0") == false && onOff("2") == nil, "on/off also as 1/0")
 
     inbox = [:]
     s.handle(3, Msg(t: "nick", from: "bob", dnd: true))
@@ -104,6 +107,10 @@ func selftest() {
 
     func hint(_ t: String, _ roster: [String] = [], _ rooms: [String] = []) -> [Suggestion] { suggest(t, Ctx(roster: roster, joined: rooms)) }
     check(hint("/").count == commands.count, "/ lists every command")
+    check(commandHelp("room") == "/room [create|set|member]*: make a room, change one, or see who's in it · /r, /r c" && commandHelp("/R")?.hasPrefix("/room ") == true
+          && commandHelp("m")?.hasPrefix("/messages ") == true && commandHelp("nope") == nil, "/help [command]: format and what it does, short forms too")
+    check(listMenu("/help") == "/help " && suggest("/help ", Ctx()).count == commands.count
+          && suggest("/help me", Ctx()).map { "\($0.label)|\($0.replace)|\($0.run)" } == ["/messages [on|off]|/help messages|true"], "/help lists commands; picking one explains it")
     check(usage(commands[0]) == "/online [username]", "parameters in square brackets")
     check(hint("/inv").first?.replace == "/invite ", "command completes with room for its argument")
     check(hint("/invite a", ["ana", "bob"]).map(\.replace) == ["/invite ana"], "/invite suggests people")
@@ -156,6 +163,9 @@ func selftest() {
     check(ed("set name lounge") == "art|name|lounge" && ed("club set desc after school") == "club|desc|after school"
           && ed("Current set TYPE 2") == "art|type|2" && ed("club lounge") == "nil" && ed("set") == "art||", "set: room name optional, current is this room")
     let own = Ctx(me: "me", room: "club", roster: ["me", "zoe", "al"], joined: ["public", "club"], members: ["me", "zoe"], owner: "me", bans: ["al"])
+    let zoes = Ctx(me: "me", room: "club", roster: ["me", "zoe"], members: ["me", "zoe"], owner: "zoe")
+    check(suggest("/online ", zoes).map(\.label) == ["me", "zoe ◆"] && suggest("/online ", Ctx(me: "me", roster: ["me", "zoe"], owner: "zoe")).map(\.label) == ["me", "zoe"],
+          "◆ marks the room's creator, inside that room")
     check(suggest("/room member ", own).map(\.replace) == ["/room member list", "/room member kick ", "/room member ban "]
           && suggest("/room member ", rc).map(\.replace) == ["/room member list"], "member: kick and ban only for the creator")
     check(suggest("/room member kick ", own).map(\.replace) == ["/room member kick zoe"]
@@ -196,7 +206,8 @@ func selftest() {
     check(online[0].detail == "friend" && online[2].detail == "you" && online.allSatisfy { $0.replace == "/online " && !$0.run },
           "status rows open a menu and leave the typed text alone")
     check(suggest("/status ", Ctx(status: 1)).map { "\($0.label) \($0.detail)" } == ["0 online", "1 do not disturb · now", "2 invisible"], "status options")
-    check(suggest("/online ", Ctx(me: "me", roster: ["al", "me"], friends: ["al"], busy: ["al"])).first?.detail == "friend · do not disturb", "do not disturb shows in the online list")
+    check(suggest("/online ", Ctx(me: "me", roster: ["al", "me"], friends: ["al"], busy: ["al"])).map { "\($0.detail) \($0.busy)" } == ["friend · do not disturb true", "you false"],
+          "do not disturb shows in the online list, with a red dot")
     let at = Ctx(me: "me", room: "club", roster: ["ana", "ana2", "al", "me", "bo"], members: ["me", "zoe"], nicks: ["zoe": "Z", "me": "M"])
     check(suggest("hi @a", at).map(\.replace) == ["hi @al", "hi @ana", "hi @ana2"], "@ completes names")
     check(suggest("hi @ana", at).map(\.label) == ["@ana", "@ana2"] && suggest("@z", at).map(\.label) == ["@Z", "@zoe"],
@@ -596,6 +607,9 @@ func selftest() {
           "update signed by another key rejected")
     let tcpOpts = tcp().defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options
     check(tcpOpts?.enableKeepalive == true && tcp().includePeerToPeer, "keepalive notices dead links; peer-to-peer stays on")
+    check(trayDotColor(connected: false, wifiOnly: true, update: true) == .systemRed && trayDotColor(connected: true, wifiOnly: true, update: true) == .systemYellow
+          && trayDotColor(connected: true, wifiOnly: false, update: true) == .systemBlue && trayDotColor(connected: true, wifiOnly: false, update: false) == nil,
+          "tray dot: red disconnected, then yellow Wi-Fi only, then blue update")
     check(onlyWiFi([["awdl0"], ["llw0", "awdl0"]]) && !onlyWiFi([["awdl0", "en0"], ["awdl0"]]) && !onlyWiFi([]),
           "other Macs found only over peer-to-peer Wi-Fi: the network keeps Macs apart; none found: can't tell")
     check(NWTXTRecord(["id": "x", "since": "12.5"])["since"].flatMap(Double.init) == 12.5, "host start time survives the TXT record")

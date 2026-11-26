@@ -22,9 +22,10 @@ Psst updates itself daily by default. The interval can be changed or updates tur
 | Esc | Go back or close |
 | ⌘Q | Quit |
 
-- Type `/` for commands. Full list: [commands.md](commands.md).
+- Type `/` for commands, or `/help`. Full list: [commands.md](commands.md).
 - Macs running Psst find each other automatically, over the network or directly over Wi-Fi. Macs out of range connect through nearby ones.
-- A yellow dot on the menu bar icon means the network (or a VPN) blocks Macs from reaching each other. Psst then uses Wi-Fi directly, which reaches only Macs within about 30 m.
+- A red dot on the menu bar icon means Psst isn't connected. A yellow dot means the network (or a VPN) blocks Macs from reaching each other, so Psst uses Wi-Fi directly, which reaches only Macs within about 30 m. A blue dot means an update is available.
+- The chat bar shows how many people are online out of everyone seen before (● 2/13). In the menu, a red dot marks do not disturb, and ◆ marks the creator of the room you're in.
 - One Mac hosts. If it quits, the next one takes over with rooms and recent messages intact.
 - Messages fade after a few seconds. `/history on` keeps them.
 - Swearing and NSFW words are hidden in messages by default and not allowed in usernames.

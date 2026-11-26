@@ -24,9 +24,18 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     var fails: [String: Int] = [:], downUntil: [String: Date] = [:], sleptAt: Date?  // see electHost, onWake
     var viaID = "", viaSince = 0.0, dialed = "", hops = 0  // the host this Mac is on, the Mac it dialled, how far
     var prevRoom = "public", lastSeen = 0.0  // to pick up where we were after reconnecting
-    var me = "", room = "public", via = "", roster: [String] = [], rooms: Set<String> = [], invited: Set<String> = []
+    var me = "" { didSet { showState() } }  // "": not connected
+    var roster: [String] = [] { didSet { showState() } }  // who's online
+    var room = "public", via = "", rooms: Set<String> = [], invited: Set<String> = []
     let status = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-    let wifiDot = Dot()  // yellow, on the menu bar icon: only peer-to-peer Wi-Fi reaches other Macs (see onlyWiFi)
+    let trayDot = Dot()  // on the menu bar icon (see showState)
+    let countDot = NSTextField(labelWithString: "●"), countLabel = NSTextField(labelWithString: "")  // in the chat bar: ● online/seen
+    /// Everyone ever seen online, for the chat bar's count.
+    // ponytail: one list for every network this Mac joins; key it by network if people move between groups.
+    var everSeen: [String] {
+        get { d.stringArray(forKey: "everSeen") ?? [] }
+        set { d.set(newValue, forKey: "everSeen") }
+    }
     var onWiFi: Bool { onlyWiFi(hosts.filter { ad($0)?.id != server?.id }.map { $0.interfaces.map(\.name) }) }
     let stack = NSStackView(), field = NSTextField(), hintLabel = NSTextField(wrappingLabelWithString: "")
     let feedDoc = Flipped()
@@ -47,11 +56,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     let updateBox = NSButton(checkboxWithTitle: "Install automatically, checking", target: nil, action: nil)
     let updateLabel = NSTextField(labelWithString: "Psst \(appVersion)")
     let checkButton = NSButton(title: "Check Now", target: nil, action: nil), updateNowButton = NSButton(title: "Update Now", target: nil, action: nil)
-    var latest: String?, updateState: String?  // newest version on GitHub, once looked; what the updater is doing
+    var latest: String? { didSet { showState() } }  // newest version on GitHub, once looked
+    var updateState: String?  // what the updater is doing
     let filterBox = NSButton(checkboxWithTitle: "Hide swearing and NSFW words", target: nil, action: nil)
     let typingBox = NSButton(checkboxWithTitle: "Show typing indicators, and share mine", target: nil, action: nil)
     let mentionBox = NSButton(checkboxWithTitle: "Play a sound when someone @mentions me", target: nil, action: nil)
-    let pingsBox = NSButton(checkboxWithTitle: "Let people ping me (flashes my screen edges)", target: nil, action: nil)
+    let pingsBox = NSButton(checkboxWithTitle: "Let people ping me (flashes their name on my screen)", target: nil, action: nil)
     let receiveBox = NSButton(checkboxWithTitle: "Receive messages (off: stay online, see nothing new)", target: nil, action: nil)
     let saveButton = NSButton(title: "Save", target: nil, action: nil)
     let shortcutButton = NSButton(title: "", target: nil, action: nil)
@@ -120,7 +130,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         b.browseResultsChangedHandler = { [weak self] results, _ in
             guard let self else { return }
             self.hosts = Array(results)
-            self.wifiDot.isHidden = !self.onWiFi
+            self.showState()
             self.regroup()
         }
         b.start(queue: .main)
@@ -132,15 +142,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         status.button?.image = NSImage(systemSymbolName: "bubble.left", accessibilityDescription: "Psst")
         status.button?.appearsDisabled = true
         if let b = status.button {
-            wifiDot.isHidden = true
-            wifiDot.wantsLayer = true
-            wifiDot.layer?.backgroundColor = NSColor.systemYellow.cgColor
-            wifiDot.layer?.cornerRadius = 3.5
-            wifiDot.translatesAutoresizingMaskIntoConstraints = false
-            b.addSubview(wifiDot)
-            NSLayoutConstraint.activate([wifiDot.widthAnchor.constraint(equalToConstant: 7), wifiDot.heightAnchor.constraint(equalToConstant: 7),
-                                         wifiDot.trailingAnchor.constraint(equalTo: b.trailingAnchor, constant: -1),
-                                         wifiDot.bottomAnchor.constraint(equalTo: b.bottomAnchor, constant: -2)])
+            trayDot.wantsLayer = true
+            trayDot.layer?.cornerRadius = 3.5
+            trayDot.translatesAutoresizingMaskIntoConstraints = false
+            b.addSubview(trayDot)
+            NSLayoutConstraint.activate([trayDot.widthAnchor.constraint(equalToConstant: 7), trayDot.heightAnchor.constraint(equalToConstant: 7),
+                                         trayDot.trailingAnchor.constraint(equalTo: b.trailingAnchor, constant: -1),
+                                         trayDot.bottomAnchor.constraint(equalTo: b.bottomAnchor, constant: -2)])
         }
         let menu = NSMenu()
         menu.delegate = self
@@ -187,7 +195,14 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         grip.image = NSImage(systemSymbolName: "line.3.horizontal", accessibilityDescription: "Drag to move")
         grip.contentTintColor = .tertiaryLabelColor
         grip.setContentHuggingPriority(.required, for: .horizontal)
-        let row = NSStackView(views: [grip, field])
+        for v in [countDot, countLabel] {  // plain labels: an attributed one loses its width in the stack
+            v.font = .systemFont(ofSize: 12)
+            v.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+            v.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+        }
+        countLabel.textColor = .secondaryLabelColor
+        let row = NSStackView(views: [grip, field, countDot, countLabel])
+        row.setCustomSpacing(2, after: countDot)
         row.spacing = 6
         field.topAnchor.constraint(equalTo: row.topAnchor).isActive = true  // the field fills the bar as it grows
         field.bottomAnchor.constraint(equalTo: row.bottomAnchor).isActive = true
@@ -210,6 +225,20 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         applyLock()
         layout()
         setRoom("public")
+        showState()
+    }
+
+    /// The menu bar dot (see trayDotColor) and the chat bar's
+    /// count: online now / everyone seen before.
+    func showState() {
+        let all = Set(everSeen).union(roster)
+        if all.count != everSeen.count { everSeen = all.sorted() }
+        let color = trayDotColor(connected: !me.isEmpty, wifiOnly: onWiFi, update: updateText(latest, state: nil).canUpdate)
+        trayDot.isHidden = color == nil
+        trayDot.layer?.backgroundColor = color?.cgColor
+        countDot.textColor = me.isEmpty ? .tertiaryLabelColor : .systemGreen
+        countLabel.stringValue = "\(roster.count)/\(all.count)"
+        countLabel.toolTip = "\(roster.count) online now, \(all.count) seen before"
     }
 
     func registerHotKey() {
@@ -296,7 +325,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         col.alignment = right ? .trailing : .leading
         col.spacing = 2
         let head = NSMutableAttributedString()
-        if !mine { head.append(NSAttributedString(string: friendNames[from] ?? m.nick ?? from, attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .semibold), .foregroundColor: nameColor(from, m.color)])) }
+        if !mine { head.append(NSAttributedString(string: (friendNames[from] ?? m.nick ?? from) + (r != "public" && roomOwner[r] == from ? " ◆" : ""), attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .semibold), .foregroundColor: nameColor(from, m.color)])) }
         if r != "public" { head.append(NSAttributedString(string: (mine ? "" : " · ") + "#" + r, attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor])) }
         if head.length > 0 { col.addArrangedSubview(NSTextField(labelWithAttributedString: head)) }
         col.addArrangedSubview(bubble(text, tint: mine))
@@ -407,13 +436,14 @@ extension App {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        func add(_ title: String, _ action: Selector? = nil, _ obj: Any? = nil, on: Bool = false, indent: Bool = false) {
+        @discardableResult func add(_ title: String, _ action: Selector? = nil, _ obj: Any? = nil, on: Bool = false, indent: Bool = false) -> NSMenuItem {
             let i = NSMenuItem(title: title, action: action, keyEquivalent: "")
             i.target = self
             i.representedObject = obj
             i.state = on ? .on : .off
             i.indentationLevel = indent ? 1 : 0
             menu.addItem(i)
+            return i
         }
         if menu === ctx {
             add("Lock position", #selector(toggleLock), on: d.bool(forKey: "locked"))
@@ -428,15 +458,21 @@ extension App {
         menu.addItem(.separator())
 
         let others = roster.filter { $0 != me }
-        add((wifi ? "Online (discovered)" : "Online") + " · \(others.count)" + (room == "public" ? "" : ": click to invite to #\(room)"))
-        for n in others {
-            add((friends.contains(n) ? "★ " : "") + listed(n), room == "public" ? nil : #selector(invite(_:)), n, indent: true)
+        add((wifi ? "Online (discovered)" : "Online") + " · \(roster.count)" + (room == "public" ? "" : ": click to invite to #\(room)"))
+        for n in others {  // ★ friend, ◆ this room's creator, red dot: do not disturb
+            let i = add((friends.contains(n) ? "★ " : "") + listed(n) + (room != "public" && roomOwner[room] == n ? " ◆" : ""),
+                        room == "public" ? nil : #selector(invite(_:)), n, indent: true)
+            guard busy.contains(n) else { continue }
+            let font = NSFont.menuFont(ofSize: 0)  // colors set here stay, even on a greyed-out row
+            let t = NSMutableAttributedString(string: i.title, attributes: [.font: font, .foregroundColor: room == "public" ? NSColor.disabledControlTextColor : .labelColor])
+            t.append(NSAttributedString(string: " ●", attributes: [.font: font, .foregroundColor: NSColor.systemRed]))
+            i.attributedTitle = t
         }
         menu.addItem(.separator())
 
         add("Settings…", #selector(openSettings))
         if updateText(latest, state: nil).canUpdate { add("Update available: \(latest!)…", #selector(updateNow)) }
-        else { add("Psst \(appVersion)" + (d.bool(forKey: "autoUpdate") ? ", updates itself" : "")) }
+        else { add("Psst \(appVersion) · auto update: " + (d.bool(forKey: "autoUpdate") ? "on" : "off")) }
         menu.addItem(NSMenuItem(title: "Quit Psst", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
     }
 }
