@@ -115,7 +115,6 @@ extension App {
         if friends.contains(old) { friends = friends.map { $0 == old ? new : $0 } }
         if blocked.contains(old) { blocked = blocked.map { $0 == old ? new : $0 } }
         if let alias = friendNames[old] { friendNames[old] = nil; friendNames[new] = alias }
-        everSeen.removeAll { $0 == old }
     }
 
     func ad(_ r: NWBrowser.Result) -> HostAd? {  // nil: an older Psst, not part of the election

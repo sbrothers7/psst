@@ -79,7 +79,7 @@ func helpTopics(shortcut: String) -> [(title: String, rows: [(key: String, dot: 
                  ("@name", nil, "mention someone: they hear a sound. Tab completes names"),
                  ("name#0412", nil, "a name and its tag, for when two people share a name: works in @mentions and wherever a username goes. Settings > Profile shows yours"),
                  ("drag a message", nil, "move the overlay; right-click it to lock it in place")]),
-     ("Symbols", [("2/13", .green, "in the chat bar: people online now / everyone seen before"),
+     ("Symbols", [("2", .green, "in the chat bar: people online now"),
                   ("menu bar icon", .red, "not connected"),
                   ("menu bar icon", .yellow, "the network blocks Macs from reaching each other, so Psst uses Wi-Fi directly (about 30 m)"),
                   ("menu bar icon", .blue, "an update is available"),

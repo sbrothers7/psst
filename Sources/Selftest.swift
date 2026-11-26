@@ -646,7 +646,7 @@ func selftest() {
     check(NWTXTRecord(["id": "x", "since": "12.5"])["since"].flatMap(Double.init) == 12.5, "host start time survives the TXT record")
     check(tagVersion(URL(string: "https://github.com/sbrothers7/psst/releases/tag/v1.4.0")) == "1.4.0"
           && tagVersion(URL(string: "https://github.com/sbrothers7/psst/releases")) == nil && tagVersion(nil) == nil, "version from the latest release's tag")
-    check(isNewer("1.10", than: "1.9") && isNewer("1.3.1", than: "1.3") && isNewer("1.4", than: "1.3.1") && isNewer("1.0\n", than: "0") && !isNewer("1.2", than: "1.2") && !isNewer("1.1", than: "1.2"),
+    check(isNewer("1.10", than: "1.9") && isNewer("1.3.1", than: "1.3") && isNewer("1.4", than: "1.3.1") && isNewer("1.0\n", than: "0") && !isNewer("1.2", than: "1.2") && !isNewer("1.1", than: "1.2") && isNewer("1.1.2-1", than: "1.1.2") && isNewer("1.1.3", than: "1.1.2-1") && !isNewer("1.1.2", than: "1.1.2-1"),
           "version compare")
     check(updateText(nil, state: nil, current: "1.1") == ("Psst 1.1", false) && updateText("1.1", state: nil, current: "1.1") == ("Psst 1.1 is up to date", false)
           && updateText("1.2", state: nil, current: "1.1") == ("Update available: 1.2", true) && updateText("1.2", state: "Downloading…", current: "1.1") == ("Downloading…", false)

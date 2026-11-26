@@ -30,13 +30,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     let status = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     let trayDot = Dot()  // on the menu bar icon (see showState)
     lazy var stackWidth = stack.widthAnchor.constraint(equalToConstant: barWidth)  // follows Size (applyScale)
-    let countDot = NSTextField(labelWithString: "●"), countLabel = NSTextField(labelWithString: "")  // in the chat bar: ● online/seen
-    /// Everyone ever seen online, for the chat bar's count.
-    // ponytail: one list for every network this Mac joins; key it by network if people move between groups.
-    var everSeen: [String] {
-        get { d.stringArray(forKey: "everSeen") ?? [] }
-        set { d.set(newValue, forKey: "everSeen") }
-    }
+    let countDot = NSTextField(labelWithString: "●"), countLabel = NSTextField(labelWithString: "")  // in the chat bar: ● online now
     var onWiFi: Bool { onlyWiFi(hosts.filter { ad($0)?.id != server?.id }.map { $0.interfaces.map(\.name) }) }
     let stack = NSStackView(), field = NSTextField(), hintLabel = NSTextField(wrappingLabelWithString: "")
     let feedDoc = Flipped()
@@ -236,18 +230,14 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         showState()
     }
 
-    /// The menu bar dot (see trayDotColor) and the chat bar's
-    /// count: online now / everyone seen before.
+    /// The menu bar dot (see trayDotColor) and the chat bar's online count.
     func showState() {
-        let tagged = Set(roster.map { splitTag($0).name }.filter { n in roster.contains { $0.hasPrefix(n + "#") } })
-        let all = Set(everSeen).union(roster).filter { !tagged.contains($0) }  // ana from before tags is ana#0412 now
-        if all.count != everSeen.count { everSeen = all.sorted() }
         let color = trayDotColor(connected: !me.isEmpty, wifiOnly: onWiFi, update: updateText(latest, state: nil).canUpdate)
         trayDot.isHidden = color == nil
         trayDot.layer?.backgroundColor = color?.cgColor
         countDot.textColor = me.isEmpty ? .tertiaryLabelColor : .systemGreen
-        countLabel.stringValue = "\(roster.count)/\(all.count)"
-        countLabel.toolTip = "\(roster.count) online now, \(all.count) seen before"
+        countLabel.stringValue = "\(roster.count)"
+        countLabel.toolTip = "\(roster.count) online now"
     }
 
     func registerHotKey() {
