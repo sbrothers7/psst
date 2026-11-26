@@ -31,6 +31,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     let trayDot = Dot()  // on the menu bar icon (see showState)
     lazy var stackWidth = stack.widthAnchor.constraint(equalToConstant: barWidth)  // follows Size (applyScale)
     let countDot = NSTextField(labelWithString: "●"), countLabel = NSTextField(labelWithString: "")  // in the chat bar: ● online now
+    let roomLock = NSImageView()  // left of the count, in a private (encrypted) room
     var onWiFi: Bool { onlyWiFi(hosts.filter { ad($0)?.id != server?.id }.map { $0.interfaces.map(\.name) }) }
     let stack = NSStackView(), field = NSTextField(), hintLabel = NSTextField(wrappingLabelWithString: "")
     let feedDoc = Flipped()
@@ -89,7 +90,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
     var busy: [String] = []                  // online people in do not disturb
     var typingSentAt = Date.distantPast, typingRow: Row?
     var known: [String: String] = [:]        // name -> latest public key seen from the host
-    var members: [String: [String: String]] = [:]  // private room -> member name -> public key
+    var members: [String: [String: String]] = [:] { didSet { showState() } }  // private room -> member name -> public key
     var changed: [String: String] = [:]      // name -> new key that doesn't match the remembered one
     var openRooms: [String: Int] = [:]       // private rooms on the network -> people in each
     var locked: Set<String> = []             // rooms that take a password
@@ -203,7 +204,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
             v.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
         }
         countLabel.textColor = .secondaryLabelColor
-        let row = NSStackView(views: [grip, field, countDot, countLabel])
+        roomLock.image = NSImage(systemSymbolName: "lock.fill", accessibilityDescription: "Encrypted room")
+        roomLock.symbolConfiguration = .init(pointSize: 11 * uiScale, weight: .regular)
+        roomLock.contentTintColor = .secondaryLabelColor
+        roomLock.toolTip = "This room is end-to-end encrypted"
+        roomLock.isHidden = true
+        roomLock.setContentHuggingPriority(.required, for: .horizontal)
+        let row = NSStackView(views: [grip, field, roomLock, countDot, countLabel])
         row.setCustomSpacing(2, after: countDot)
         row.spacing = 6
         field.topAnchor.constraint(equalTo: row.topAnchor).isActive = true  // the field fills the bar as it grows
@@ -230,14 +237,17 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTextFieldDel
         showState()
     }
 
-    /// The menu bar dot (see trayDotColor) and the chat bar's online count.
+    /// The menu bar dot (see trayDotColor) and the chat bar's online count: the room's, inside a private room.
     func showState() {
         let color = trayDotColor(connected: !me.isEmpty, wifiOnly: onWiFi, update: updateText(latest, state: nil).canUpdate)
         trayDot.isHidden = color == nil
         trayDot.layer?.backgroundColor = color?.cgColor
         countDot.textColor = me.isEmpty ? .tertiaryLabelColor : .systemGreen
-        countLabel.stringValue = "\(roster.count)"
-        countLabel.toolTip = "\(roster.count) online now"
+        let inRoom = room != "public"
+        let n = inRoom ? members[room]?.count ?? 0 : roster.count
+        roomLock.isHidden = !inRoom
+        countLabel.stringValue = "\(n)"
+        countLabel.toolTip = inRoom ? "\(n) online in #\(room)" : "\(n) online now"
     }
 
     func registerHotKey() {

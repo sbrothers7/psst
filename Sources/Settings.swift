@@ -505,6 +505,7 @@ extension App {
         scaleValue.stringValue = "\(Int((uiScale * 100).rounded()))%"
         field.font = .systemFont(ofSize: 13 * uiScale)
         for v in [countDot, countLabel] { v.font = .systemFont(ofSize: 12 * uiScale) }
+        roomLock.symbolConfiguration = .init(pointSize: 11 * uiScale, weight: .regular)
         hintLabel.preferredMaxLayoutWidth = barWidth - 20
         stackWidth.constant = barWidth
         fitInput()

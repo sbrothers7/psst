@@ -168,7 +168,8 @@ extension App {
 
     func setRoom(_ r: String) {
         room = r
-        field.placeholderString = "#\(r)\(r == "public" ? "" : " 🔒") · / commands · : emoji · **markdown**"
+        field.placeholderString = "#\(r) · / commands · : emoji · **markdown**"
+        showState()
     }
 
     func submit(_ raw: String) {

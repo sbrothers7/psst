@@ -79,7 +79,7 @@ func helpTopics(shortcut: String) -> [(title: String, rows: [(key: String, dot: 
                  ("@name", nil, "mention someone: they hear a sound. Tab completes names"),
                  ("name#0412", nil, "a name and its tag, for when two people share a name: works in @mentions and wherever a username goes. Settings > Profile shows yours"),
                  ("drag a message", nil, "move the overlay; right-click it to lock it in place")]),
-     ("Symbols", [("2", .green, "in the chat bar: people online now"),
+     ("Symbols", [("2", .green, "in the chat bar: people online now, or in your room when you're in a private one. A lock beside it: that room is end-to-end encrypted"),
                   ("menu bar icon", .red, "not connected"),
                   ("menu bar icon", .yellow, "the network blocks Macs from reaching each other, so Psst uses Wi-Fi directly (about 30 m)"),
                   ("menu bar icon", .blue, "an update is available"),
@@ -92,14 +92,11 @@ func helpTopics(shortcut: String) -> [(title: String, rows: [(key: String, dot: 
 struct HelpView: View {
     let focus: String?, shortcut: String
     @State private var query = ""
-    @AppStorage("helpClosed") private var closedList = ""  // sections folded away, kept for next time ("|"-separated)
+    @State private var opened: Set<String> = []  // every section starts folded
 
     func matches(_ parts: String...) -> Bool { query.isEmpty || parts.contains { $0.localizedCaseInsensitiveContains(query) } }
-    var closed: Set<String> { Set(closedList.split(separator: "|").map(String.init)) }
-    func isOpen(_ title: String) -> Bool { !query.isEmpty || !closed.contains(title) }  // searching opens everything
-    func setOpen(_ title: String, _ open: Bool) {
-        closedList = (open ? closed.subtracting([title]) : closed.union([title])).sorted().joined(separator: "|")
-    }
+    func isOpen(_ title: String) -> Bool { !query.isEmpty || opened.contains(title) }  // searching opens everything
+    func setOpen(_ title: String, _ open: Bool) { if open { opened.insert(title) } else { opened.remove(title) } }
 
     /// A section title that folds the section away, and back.
     func header(_ title: String) -> some View {
